@@ -61,7 +61,9 @@ class BasicTrainer(Trainer):
         
         # Load loss weights from config (respect user's settings regardless of use_sdf)
         self.loss_weights = train_cfg.get("train", {}).get("current_loss_weights", [1.0, 1.0])
-        self.projection_weight, self.sdf_loss_weight = self.loss_weights
+        self.projection_weight, self.sdf_loss_weight = (
+            float(weight) for weight in self.loss_weights
+        )
         
         print(f"SDF Mode: {self.use_sdf}, Alpha: {self.sdf_alpha}")
         print(f"Loss Weights - Projection: {self.projection_weight}, SDF: {self.sdf_loss_weight}")
@@ -82,56 +84,74 @@ class BasicTrainer(Trainer):
 
         projs = data.projs
         
-        # Use autocast for mixed precision to save memory
+        # Mixed precision is restricted to the MLP. The physical projector,
+        # exponential silhouette map, distance transform and losses remain
+        # FP32 to avoid underflow and false zero-gradient runs.
         with torch.amp.autocast(enabled=self.use_mixed_precision, dtype=torch.float16, device_type='cuda'):
-            # Process network in chunks to save memory
             net_pred = run_network(self.voxels, self.net, self.netchunk)
             train_output = net_pred.squeeze()[None, ...]
 
-            if self.use_sdf:
-                # SDF mode: network generates SDF, convert to occupancy for projections
-                from src.render.sdf_utils import sdf_to_occupancy
-                train_output_sdf = train_output
-                train_output_occupancy = sdf_to_occupancy(train_output_sdf, alpha=self.sdf_alpha)
-            else:
-                # Occupancy mode: network generates occupancy directly
-                train_output_occupancy = train_output
-                train_output_sdf = None
+        if self.use_sdf:
+            from src.render.sdf_utils import sdf_to_occupancy
 
-            train_projs = self.render_occupancy_projections(train_output_occupancy)
-            
-            # Main projection loss (occupancy-based)
+            with torch.amp.autocast(
+                device_type=train_output.device.type, enabled=False
+            ):
+                train_output_sdf = train_output
+                train_output_occupancy = sdf_to_occupancy(
+                    train_output_sdf.float(), alpha=self.sdf_alpha
+                )
+        else:
+            train_output_occupancy = train_output.float()
+            train_output_sdf = None
+
+        train_projs, raw_train_projs = self.render_occupancy_projections(
+            train_output_occupancy, return_raw=True
+        )
+
+        with torch.amp.autocast(
+            device_type=train_projs.device.type, enabled=False
+        ):
             projection_loss = self.l2_loss(train_projs, projs.float())
-            
-            # Add 2D SDF loss (works for both SDF and occupancy modes)
-            sdf_2d_loss = torch.tensor(0.0, device=projs.device, requires_grad=True)
-            if (self.sdf_loss_weight > 0 and 
-                hasattr(data, 'sdf_projs') and data.sdf_projs is not None):
-                
-                detector_pixel_size = self.dataconfig["dDetector"][0]
-                
-                from src.render.sdf_utils import occupancy_to_sdf_2d
-                # Reuse the projections already computed for the occupancy loss.
-                # This avoids two extra ASTRA forward projections per epoch.
-                sdf_2d_view1 = occupancy_to_sdf_2d(
-                    train_projs[0, 0], voxel_size=detector_pixel_size
+
+        sdf_2d_loss = projs.new_zeros(())
+        if (self.sdf_loss_weight > 0 and
+            hasattr(data, 'sdf_projs') and data.sdf_projs is not None):
+
+            detector_pixel_size = self.dataconfig["dDetector"][0]
+
+            from src.render.sdf_utils import occupancy_to_sdf_2d
+            # Reuse the projections already computed for the occupancy loss.
+            # This avoids two extra ASTRA forward projections per epoch.
+            sdf_2d_view1 = occupancy_to_sdf_2d(
+                train_projs[0, 0], voxel_size=detector_pixel_size
+            )
+            sdf_2d_view2 = occupancy_to_sdf_2d(
+                train_projs[0, 1], voxel_size=detector_pixel_size
+            )
+            pred_sdf_2d = torch.stack(
+                [sdf_2d_view1, sdf_2d_view2], dim=0
+            )[None, ...]
+
+            with torch.amp.autocast(
+                device_type=pred_sdf_2d.device.type, enabled=False
+            ):
+                sdf_2d_loss = self.l2_loss(
+                    pred_sdf_2d.float(), data.sdf_projs.float()
                 )
-                sdf_2d_view2 = occupancy_to_sdf_2d(
-                    train_projs[0, 1], voxel_size=detector_pixel_size
-                )
-                pred_sdf_2d = torch.stack(
-                    [sdf_2d_view1, sdf_2d_view2], dim=0
-                )[None, ...]
-                
-                sdf_2d_loss = self.l2_loss(pred_sdf_2d, data.sdf_projs.float())
-            
-            # Combine losses with weights
-            total_loss = (self.projection_weight * projection_loss + 
-                         self.sdf_loss_weight * sdf_2d_loss)
-            
-            loss["loss"] = total_loss
-            loss["projection_loss"] = projection_loss
-            loss["sdf_2d_loss"] = sdf_2d_loss
+
+        total_loss = (self.projection_weight * projection_loss +
+                      self.sdf_loss_weight * sdf_2d_loss)
+
+        loss["loss"] = total_loss
+        loss["projection_loss"] = projection_loss
+        loss["sdf_2d_loss"] = sdf_2d_loss
+        loss["occupancy_min"] = train_output_occupancy.detach().amin()
+        loss["occupancy_max"] = train_output_occupancy.detach().amax()
+        loss["raw_projection_min"] = raw_train_projs.detach().amin()
+        loss["raw_projection_max"] = raw_train_projs.detach().amax()
+        loss["projection_min"] = train_projs.detach().amin()
+        loss["projection_max"] = train_projs.detach().amax()
 
         return loss
 

@@ -28,6 +28,8 @@ network:
   skips: [4]
   out_dim: 1
   bound: 0.3
+  # sigmoid(-50 * 0.1) ~= 0.0067 initial occupancy, avoiding a solid cube.
+  sdf_initial_bias: 0.1
   use_gradient_checkpointing: true
 
 encoder:
@@ -57,6 +59,8 @@ train:
   memory_efficient_eval: true
   use_sdf: true
   sdf_alpha: 50.0
+  minimum_gradient_norm: 0.000000000001
+  zero_gradient_patience: 20
   # Used only for direct binary-mask inputs. The generated line-integral NPZ
   # bypasses this transform and matches the original SDF-CAR projection loss.
   projection_attenuation: 1.0

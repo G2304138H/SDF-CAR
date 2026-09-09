@@ -1,12 +1,44 @@
-import torch
+import math
+
 import numpy as np
+import torch
 from scipy import ndimage
 try:
     from kornia.contrib import distance_transform
     KORNIA_AVAILABLE = True
 except ImportError:
     KORNIA_AVAILABLE = False
-    print("Warning: kornia not available, falling back to scipy distance transform (non-differentiable)")
+    print(
+        "Warning: kornia not available; SciPy distance transforms are "
+        "non-differentiable and cannot be used as a training loss."
+    )
+
+
+def require_differentiable_distance_transform():
+    """Fail clearly when the configured geometric training loss cannot backprop."""
+    if not KORNIA_AVAILABLE:
+        raise RuntimeError(
+            "The 2D SDF training loss requires Kornia's differentiable distance "
+            "transform. Install it with `python -m pip install kornia`, or set "
+            "train.current_loss_weights[1] to 0 to disable the SDF loss. The "
+            "SciPy fallback is valid only for targets/evaluation because it "
+            "detaches tensors from autograd."
+        )
+
+
+def ray_integral_to_binary_probability(ray_integrals, attenuation=1.0):
+    """Map non-negative ray lengths to silhouette probabilities in FP32.
+
+    ``-expm1(-x)`` is equivalent to ``1-exp(-x)`` but is more accurate near
+    zero.  Disabling autocast here prevents the exponential derivative from
+    underflowing prematurely in FP16.
+    """
+    attenuation = float(attenuation)
+    if not math.isfinite(attenuation) or attenuation <= 0.0:
+        raise ValueError("projection attenuation must be finite and positive.")
+    with torch.amp.autocast(device_type=ray_integrals.device.type, enabled=False):
+        lengths = torch.clamp_min(ray_integrals.float(), 0.0)
+        return -torch.expm1(-attenuation * lengths)
 
 
 def sdf_to_occupancy(sdf, alpha=50.0):
@@ -50,15 +82,17 @@ def occupancy_to_sdf_2d(occupancy_2d, voxel_size=1.0, use_kornia=True):
         # Kornia defines DT(image) as distance to the nearest non-zero pixel.
         # Keeping this mask soft preserves the gradient from the geometric loss
         # back to the projected volume.  A hard ``> 0.5`` conversion here would
-        # sever that gradient entirely.
-        soft_mask = occupancy_2d.clamp(0.0, 1.0).unsqueeze(1)
+        # sever that gradient entirely. Keep the transform in FP32 since its
+        # iterative exponentials are numerically fragile in mixed precision.
+        with torch.amp.autocast(device_type=device.type, enabled=False):
+            soft_mask = occupancy_2d.float().clamp(0.0, 1.0).unsqueeze(1)
 
-        # Positive outside and negative inside.  For a binary input,
-        # DT(mask) is zero inside and positive outside; DT(1-mask) is the
-        # converse.
-        distance_to_foreground = distance_transform(soft_mask) * voxel_size
-        distance_to_background = distance_transform(1.0 - soft_mask) * voxel_size
-        sdf_2d = (distance_to_foreground - distance_to_background).squeeze(1)
+            # Positive outside and negative inside.  For a binary input,
+            # DT(mask) is zero inside and positive outside; DT(1-mask) is the
+            # converse.
+            distance_to_foreground = distance_transform(soft_mask) * voxel_size
+            distance_to_background = distance_transform(1.0 - soft_mask) * voxel_size
+            sdf_2d = (distance_to_foreground - distance_to_background).squeeze(1)
         
         # Remove batch dimension if input was 2D
         if len(original_shape) == 2:

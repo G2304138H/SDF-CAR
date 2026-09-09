@@ -83,6 +83,28 @@ class Trainer:
         self.projection_attenuation = float(
             cfg.get("train", {}).get("projection_attenuation", 1.0)
         )
+        self.minimum_gradient_norm = float(
+            cfg.get("train", {}).get("minimum_gradient_norm", 1.0e-12)
+        )
+        self.zero_gradient_patience = int(
+            cfg.get("train", {}).get("zero_gradient_patience", 20)
+        )
+        if self.minimum_gradient_norm < 0.0:
+            raise ValueError("train.minimum_gradient_norm must be non-negative.")
+        if self.zero_gradient_patience <= 0:
+            raise ValueError("train.zero_gradient_patience must be positive.")
+        self.dead_gradient_epochs = 0
+        self.trainer_stability_fixes = [
+            "positive configurable SDF output bias prevents a dense 0.5-occupancy initialization",
+            "ODL projection and binary ray-to-mask exponential run in FP32",
+            "2D SDF training loss fails fast unless differentiable Kornia is installed",
+            "loss components, tensor ranges, gradient norm, AMP skips, and parameter updates are logged",
+            "training aborts after consecutive dead-gradient epochs instead of silently wasting the run",
+        ]
+        self.training_log_path = osp.join(
+            self.output_recon_dir,
+            f"training_log_{self.current_model_id}.jsonl",
+        )
 
         if projection_npz:
             if (
@@ -299,7 +321,19 @@ class Trainer:
             
         # Load loss weights from config (respect user's settings regardless of use_sdf)
         self.loss_weights = cfg.get("train", {}).get("current_loss_weights", [1.0, 1.0])
-        self.projection_weight, self.sdf_loss_weight = self.loss_weights
+        self.projection_weight, self.sdf_loss_weight = (
+            float(weight) for weight in self.loss_weights
+        )
+        if self.projection_weight < 0.0 or self.sdf_loss_weight < 0.0:
+            raise ValueError("Loss weights must be non-negative.")
+        if self.projection_weight == 0.0 and self.sdf_loss_weight == 0.0:
+            raise ValueError("At least one training loss weight must be positive.")
+        if self.sdf_loss_weight > 0.0:
+            from src.render.sdf_utils import (
+                require_differentiable_distance_transform,
+            )
+
+            require_differentiable_distance_transform()
         
         print(f"SDF Mode: {self.use_sdf}")
         print(f"Loss Weights - Projection: {self.projection_weight}, SDF: {self.sdf_loss_weight}")
@@ -343,21 +377,68 @@ class Trainer:
         if torch.cuda.is_available():
             torch.cuda.synchronize()
 
-    def render_occupancy_projections(self, occupancy):
+    def render_occupancy_projections(self, occupancy, *, return_raw=False):
         """Project a 3D occupancy field into the two configured detector views."""
-        projection_one = self.ct_projector_first.forward_project(occupancy)
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        projection_two = self.ct_projector_second.forward_project(occupancy)
-        projections = torch.cat((projection_one, projection_two), dim=1)
-        if self.binary_projection_targets:
-            # External Stage-2 inputs are binary silhouettes, whereas ASTRA/ODL
-            # returns a non-negative line integral.  Convert that integral to a
-            # bounded, differentiable ray-occupancy probability.
-            projections = 1.0 - torch.exp(
-                -self.projection_attenuation * torch.clamp_min(projections, 0.0)
+        # ODL/ASTRA and the exponential silhouette map are numerically sensitive
+        # in FP16. Keep this physical rendering path in FP32 while allowing the
+        # MLP itself to use mixed precision.
+        with torch.amp.autocast(device_type=occupancy.device.type, enabled=False):
+            occupancy_fp32 = occupancy.float()
+            projection_one = self.ct_projector_first.forward_project(
+                occupancy_fp32
             )
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            projection_two = self.ct_projector_second.forward_project(
+                occupancy_fp32
+            )
+            raw_projections = torch.cat((projection_one, projection_two), dim=1)
+        projections = raw_projections
+        if self.binary_projection_targets:
+            from src.render.sdf_utils import ray_integral_to_binary_probability
+
+            projections = ray_integral_to_binary_probability(
+                raw_projections, self.projection_attenuation
+            )
+        if return_raw:
+            return projections, raw_projections
         return projections
+
+    def _initialize_training_log(self):
+        target_projections = self.train_dset.projs.detach().float()
+        metadata = {
+            "event": "trainer_stability_fixes",
+            "case_id": str(self.current_model_id),
+            "fixes": self.trainer_stability_fixes,
+            "minimum_gradient_norm": self.minimum_gradient_norm,
+            "zero_gradient_patience": self.zero_gradient_patience,
+            "mixed_precision_network": bool(self.use_mixed_precision),
+            "sdf_initial_bias": float(
+                self.conf.get("network", {}).get("sdf_initial_bias", 0.1)
+            ),
+            "sdf_alpha": float(
+                self.conf.get("train", {}).get("sdf_alpha", 50.0)
+            ),
+            "projection_attenuation": self.projection_attenuation,
+            "projection_representation": (
+                "binary_mask" if self.binary_projection_targets
+                else "line_integral_mm"
+            ),
+            "target_projection_min": float(target_projections.amin().item()),
+            "target_projection_max": float(target_projections.amax().item()),
+            "target_projection_mean": float(target_projections.mean().item()),
+        }
+        with open(self.training_log_path, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(metadata) + "\n")
+        print("Trainer stability fixes active:")
+        for fix in self.trainer_stability_fixes:
+            print(f"  - {fix}")
+        print(f"Training diagnostics log: {self.training_log_path}")
+
+    def _append_training_log(self, epoch, diagnostics):
+        record = {"event": "epoch", "epoch": int(epoch), **diagnostics}
+        with open(self.training_log_path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record) + "\n")
 
     def save_loss_plot(self):
         """
@@ -388,6 +469,7 @@ class Trainer:
         self._synchronize_cuda_for_timing()
         run_started = time.perf_counter()
         optimization_started = time.perf_counter()
+        self._initialize_training_log()
 
         for idx_epoch in tqdm(range(1, self.epochs+1)):
             
@@ -404,8 +486,37 @@ class Trainer:
             # Track loss for plotting
             current_loss = loss_train['loss']
             self.training_losses.append(current_loss)
-            
-            print(f"epoch={idx_epoch}/{self.epochs}, loss={current_loss:.6f}")
+            self._append_training_log(idx_epoch, loss_train)
+
+            print(
+                f"epoch={idx_epoch}/{self.epochs}, loss={current_loss:.6f}, "
+                f"projection={loss_train['projection_loss']:.6f}, "
+                f"sdf2d={loss_train['sdf_2d_loss']:.6f}, "
+                f"grad_norm={loss_train['gradient_norm']:.3e}, "
+                f"param_delta={loss_train['parameter_probe_max_delta']:.3e}, "
+                f"occupancy=[{loss_train['occupancy_min']:.3e},"
+                f"{loss_train['occupancy_max']:.3e}], "
+                f"raw_rays=[{loss_train['raw_projection_min']:.3e},"
+                f"{loss_train['raw_projection_max']:.3e}], "
+                f"pred=[{loss_train['projection_min']:.3e},"
+                f"{loss_train['projection_max']:.3e}], "
+                f"amp_step_skipped={loss_train['amp_step_skipped']}"
+            )
+            if (
+                not np.isfinite(current_loss)
+                or not loss_train["gradients_finite"]
+            ):
+                raise RuntimeError(
+                    "Non-finite loss or gradient detected. Aborting immediately; "
+                    f"inspect {self.training_log_path}."
+                )
+            if self.dead_gradient_epochs >= self.zero_gradient_patience:
+                raise RuntimeError(
+                    "Optimization has produced no usable gradient for "
+                    f"{self.dead_gradient_epochs} consecutive epochs. Aborting "
+                    "instead of continuing a constant-loss run. Inspect "
+                    f"{self.training_log_path}."
+                )
 
         self._synchronize_cuda_for_timing()
         self.optimization_time_seconds = (
@@ -486,6 +597,8 @@ class Trainer:
             "pytorch_version": torch.__version__,
             "pytorch_cuda_version": torch.version.cuda,
             "cuda_available": torch.cuda.is_available(),
+            "trainer_stability_fixes": self.trainer_stability_fixes,
+            "training_diagnostics_log": self.training_log_path,
         }
         if torch.cuda.is_available():
             timing.update({
@@ -814,31 +927,89 @@ class Trainer:
         Memory-efficient training step with gradient accumulation and mixed precision.
         """
         # Zero gradients
-        self.optimizer.zero_grad()
-        
-        total_loss = 0.0
-        
-        # Gradient accumulation loop
-        with torch.amp.autocast('cuda', enabled=self.use_mixed_precision, dtype=torch.float16):
-            loss = self.compute_loss(data)
-            total_loss += loss["loss"].item()
+        self.optimizer.zero_grad(set_to_none=True)
+
+        loss = self.compute_loss(data)
+        diagnostics = {
+            key: float(loss[key].detach().float().item())
+            for key in (
+                "loss",
+                "projection_loss",
+                "sdf_2d_loss",
+                "occupancy_min",
+                "occupancy_max",
+                "raw_projection_min",
+                "raw_projection_max",
+                "projection_min",
+                "projection_max",
+            )
+        }
         
         # Backward pass with gradient scaling
         self.scaler.scale(loss["loss"]).backward()
-        
-        # Clear intermediate tensors
-        del loss
+
+        # Unscale before measuring the real gradient or checking finiteness.
+        self.scaler.unscale_(self.optimizer)
+        gradient_norms = []
+        gradients_finite = True
+        for parameter in self.grad_vars:
+            if parameter.grad is None:
+                continue
+            gradient = parameter.grad.detach()
+            gradients_finite = gradients_finite and bool(
+                torch.isfinite(gradient).all().item()
+            )
+            gradient_norms.append(torch.linalg.vector_norm(gradient.float()))
+        gradient_norm = (
+            float(torch.linalg.vector_norm(torch.stack(gradient_norms)).item())
+            if gradient_norms else 0.0
+        )
+
+        probe_parameter = self.grad_vars[-1]
+        probe_before = probe_parameter.detach().float().clone()
+        scale_before = float(self.scaler.get_scale())
 
         # Optimizer step with gradient scaling
         self.scaler.step(self.optimizer)
         self.scaler.update()
+        scale_after = float(self.scaler.get_scale())
+        parameter_probe_delta = float(
+            torch.max(
+                torch.abs(probe_parameter.detach().float() - probe_before)
+            ).item()
+        )
+        amp_step_skipped = (
+            not gradients_finite
+            or not np.isfinite(gradient_norm)
+            or scale_after < scale_before
+        )
+
+        dead_gradient = (
+            amp_step_skipped
+            or gradient_norm <= self.minimum_gradient_norm
+        )
+        self.dead_gradient_epochs = (
+            self.dead_gradient_epochs + 1 if dead_gradient else 0
+        )
+
+        diagnostics.update({
+            "gradient_norm": gradient_norm,
+            "gradients_finite": bool(gradients_finite),
+            "parameter_probe_max_delta": parameter_probe_delta,
+            "amp_scale_before": scale_before,
+            "amp_scale_after": scale_after,
+            "amp_step_skipped": bool(amp_step_skipped),
+            "dead_gradient_epochs": int(self.dead_gradient_epochs),
+        })
+
+        del loss, probe_before
         
         # Clear gradients and cache
-        self.optimizer.zero_grad()
+        self.optimizer.zero_grad(set_to_none=True)
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         
-        return {"loss": total_loss}
+        return diagnostics
 
     def train_step(self, data):
         """

@@ -1,9 +1,13 @@
+import math
+
 import torch
 import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
 
 class DensityNetwork(nn.Module):
-    def __init__(self, encoder, bound=0.2, num_layers=8, hidden_dim=256, skips=[4], out_dim=1, use_sdf=False, use_gradient_checkpointing=True):
+    def __init__(self, encoder, bound=0.2, num_layers=8, hidden_dim=256,
+                 skips=[4], out_dim=1, use_sdf=False,
+                 use_gradient_checkpointing=True, sdf_initial_bias=0.1):
         super().__init__()
         self.nunm_layers = num_layers
         self.hidden_dim = hidden_dim
@@ -12,6 +16,9 @@ class DensityNetwork(nn.Module):
         self.in_dim = encoder.output_dim
         self.bound = bound
         self.use_gradient_checkpointing = use_gradient_checkpointing
+        self.sdf_initial_bias = float(sdf_initial_bias)
+        if not math.isfinite(self.sdf_initial_bias):
+            raise ValueError("sdf_initial_bias must be finite.")
         
         # Linear layers
         self.layers = nn.ModuleList(
@@ -67,7 +74,7 @@ class DensityNetwork(nn.Module):
             x = self._forward_layers(x, input_pts, 0, len(self.layers))
         
         return x
-    
+
     def _init_weights_for_sdf(self):
         """
         SDF-tuned Xavier initialization for better convergence.
@@ -76,10 +83,12 @@ class DensityNetwork(nn.Module):
             if isinstance(layer, nn.Linear):
                 # Xavier uniform initialization with SDF-specific scaling
                 if i == len(self.layers) - 1:  # Final layer
-                    # Final layer should output reasonable distance values initially
-                    # Scale down to encourage small initial SDF predictions
+                    # A zero SDF produces occupancy=0.5 everywhere.  Projecting
+                    # that dense cube saturates binary silhouette rendering and
+                    # kills its gradient.  Start outside the surface instead so
+                    # the initial occupancy is sparse but still differentiable.
                     nn.init.xavier_uniform_(layer.weight, gain=0.1)
-                    nn.init.constant_(layer.bias, 0.0)
+                    nn.init.constant_(layer.bias, self.sdf_initial_bias)
                 else:
                     # Hidden layers with standard Xavier but slightly smaller gain
                     # This helps with gradient flow in deep SDF networks
@@ -92,4 +101,3 @@ def get_network(name):
         return DensityNetwork
     else:
         raise NotImplementedError(f"Network {name} not implemented")
-    

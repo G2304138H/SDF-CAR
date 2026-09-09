@@ -163,6 +163,27 @@ The one-view ODL motion partition is centred on the requested angle. This fixes
 an upstream issue where `uniform_partition(0, requested_angle, shape=1)` samples
 the midpoint (`requested_angle / 2`) rather than the requested view.
 
+### Trainer stability and diagnostics
+
+SDF mode initializes the final network bias to `0.1` by default. With
+`sdf_alpha: 50`, this starts at approximately `0.0067` occupancy rather than a
+half-filled volume whose ray integrals saturate the binary silhouette loss.
+Configure this with `network.sdf_initial_bias`.
+
+Only the neural network uses mixed precision. ODL/ASTRA projections, the
+ray-integral-to-mask exponential, the differentiable distance transform, and
+both losses run in FP32. A nonzero 2D SDF loss now requires `kornia`; the trainer
+fails with an installation command instead of silently using the detached
+SciPy fallback.
+
+Every run creates `training_log_<current_model_id>.jsonl`. Its first record
+explicitly lists the trainer fixes active for that run. Each epoch then records
+the two loss components, occupancy and projection ranges, gradient norm,
+parameter-probe change, AMP scale, and whether AMP skipped the optimizer step.
+The console prints the same critical values. If the gradient is dead for
+`train.zero_gradient_patience` consecutive epochs, training aborts and points
+to this log instead of completing a meaningless constant-loss run.
+
 During output evaluation, `reference_volume_npz` maps the centred reconstruction
 ROI back to the reference XYZ grid and supplies the GT mask for DSC.
 
