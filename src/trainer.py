@@ -89,16 +89,42 @@ class Trainer:
         self.zero_gradient_patience = int(
             cfg.get("train", {}).get("zero_gradient_patience", 20)
         )
+        self.sdf_distance_epsilon = float(
+            cfg.get("train", {}).get("sdf_distance_epsilon", 1.0e-6)
+        )
+        self.sdf_loss_warmup_epochs = int(
+            cfg.get("train", {}).get("sdf_loss_warmup_epochs", 100)
+        )
+        self.sdf_loss_ramp_epochs = int(
+            cfg.get("train", {}).get("sdf_loss_ramp_epochs", 400)
+        )
         if self.minimum_gradient_norm < 0.0:
             raise ValueError("train.minimum_gradient_norm must be non-negative.")
         if self.zero_gradient_patience <= 0:
             raise ValueError("train.zero_gradient_patience must be positive.")
+        if (
+            not math.isfinite(self.sdf_distance_epsilon)
+            or self.sdf_distance_epsilon <= 0.0
+            or self.sdf_distance_epsilon >= 0.5
+        ):
+            raise ValueError(
+                "train.sdf_distance_epsilon must be finite and strictly "
+                "between 0 and 0.5."
+            )
+        if self.sdf_loss_warmup_epochs < 0:
+            raise ValueError("train.sdf_loss_warmup_epochs must be non-negative.")
+        if self.sdf_loss_ramp_epochs < 0:
+            raise ValueError("train.sdf_loss_ramp_epochs must be non-negative.")
+        self.current_epoch = 0
         self.dead_gradient_epochs = 0
         self.trainer_stability_fixes = [
             "positive configurable SDF output bias prevents a dense 0.5-occupancy initialization",
             "ODL projection and binary ray-to-mask exponential run in FP32",
+            "Kornia distance-transform inputs are epsilon-bounded to prevent log(0) NaN gradients",
+            "projection-only warm-up and an SDF-weight ramp isolate and stabilize the two loss paths",
             "2D SDF training loss fails fast unless differentiable Kornia is installed",
             "loss components, tensor ranges, gradient norm, AMP skips, and parameter updates are logged",
+            "non-finite loss or gradients skip the optimizer step so parameters are not corrupted",
             "training aborts after consecutive dead-gradient epochs instead of silently wasting the run",
         ]
         self.training_log_path = osp.join(
@@ -412,6 +438,9 @@ class Trainer:
             "fixes": self.trainer_stability_fixes,
             "minimum_gradient_norm": self.minimum_gradient_norm,
             "zero_gradient_patience": self.zero_gradient_patience,
+            "sdf_distance_epsilon": self.sdf_distance_epsilon,
+            "sdf_loss_warmup_epochs": self.sdf_loss_warmup_epochs,
+            "sdf_loss_ramp_epochs": self.sdf_loss_ramp_epochs,
             "mixed_precision_network": bool(self.use_mixed_precision),
             "sdf_initial_bias": float(
                 self.conf.get("network", {}).get("sdf_initial_bias", 0.1)
@@ -479,6 +508,7 @@ class Trainer:
                 
             # Train
             self.net.train()
+            self.current_epoch = idx_epoch
             
             # Memory-efficient training step
             loss_train = self.train_step_memory_efficient(self.train_dset)
@@ -492,6 +522,7 @@ class Trainer:
                 f"epoch={idx_epoch}/{self.epochs}, loss={current_loss:.6f}, "
                 f"projection={loss_train['projection_loss']:.6f}, "
                 f"sdf2d={loss_train['sdf_2d_loss']:.6f}, "
+                f"sdf_weight={loss_train['sdf_2d_effective_weight']:.4f}, "
                 f"grad_norm={loss_train['gradient_norm']:.3e}, "
                 f"param_delta={loss_train['parameter_probe_max_delta']:.3e}, "
                 f"occupancy=[{loss_train['occupancy_min']:.3e},"
@@ -506,8 +537,20 @@ class Trainer:
                 not np.isfinite(current_loss)
                 or not loss_train["gradients_finite"]
             ):
+                if loss_train["sdf_2d_effective_weight"] == 0.0:
+                    failure_source = (
+                        "Failure occurred during projection-only warm-up; "
+                        "the Kornia SDF loss was not in the backward graph. "
+                        "Inspect the ODL/ASTRA projection path"
+                    )
+                else:
+                    failure_source = (
+                        "Failure occurred after the geometric SDF loss was "
+                        "enabled; inspect both loss components"
+                    )
                 raise RuntimeError(
-                    "Non-finite loss or gradient detected. Aborting immediately; "
+                    "Non-finite loss or gradient detected. "
+                    f"{failure_source}. Aborting immediately; "
                     f"inspect {self.training_log_path}."
                 )
             if self.dead_gradient_epochs >= self.zero_gradient_patience:
@@ -936,6 +979,7 @@ class Trainer:
                 "loss",
                 "projection_loss",
                 "sdf_2d_loss",
+                "sdf_2d_effective_weight",
                 "occupancy_min",
                 "occupancy_max",
                 "raw_projection_min",
@@ -944,34 +988,73 @@ class Trainer:
                 "projection_max",
             )
         }
-        
-        # Backward pass with gradient scaling
-        self.scaler.scale(loss["loss"]).backward()
-
-        # Unscale before measuring the real gradient or checking finiteness.
-        self.scaler.unscale_(self.optimizer)
-        gradient_norms = []
-        gradients_finite = True
-        for parameter in self.grad_vars:
-            if parameter.grad is None:
-                continue
-            gradient = parameter.grad.detach()
-            gradients_finite = gradients_finite and bool(
-                torch.isfinite(gradient).all().item()
-            )
-            gradient_norms.append(torch.linalg.vector_norm(gradient.float()))
-        gradient_norm = (
-            float(torch.linalg.vector_norm(torch.stack(gradient_norms)).item())
-            if gradient_norms else 0.0
+        losses_finite = all(
+            np.isfinite(diagnostics[key])
+            for key in ("loss", "projection_loss", "sdf_2d_loss")
         )
-
+        diagnostics.update({
+            "loss_stage": (
+                "projection_warmup"
+                if diagnostics["sdf_2d_effective_weight"] == 0.0
+                and self.sdf_loss_weight > 0.0
+                else (
+                    "projection_only"
+                    if self.sdf_loss_weight == 0.0
+                    else "hybrid"
+                )
+            ),
+            "total_loss_finite": bool(np.isfinite(diagnostics["loss"])),
+            "projection_loss_finite": bool(
+                np.isfinite(diagnostics["projection_loss"])
+            ),
+            "sdf_2d_loss_finite": bool(
+                np.isfinite(diagnostics["sdf_2d_loss"])
+            ),
+        })
         probe_parameter = self.grad_vars[-1]
         probe_before = probe_parameter.detach().float().clone()
         scale_before = float(self.scaler.get_scale())
+        gradient_norms = []
+        gradients_finite = bool(losses_finite)
 
-        # Optimizer step with gradient scaling
-        self.scaler.step(self.optimizer)
-        self.scaler.update()
+        if losses_finite:
+            # Backward pass with gradient scaling. Unscale before measuring the
+            # real gradient or deciding whether the optimizer may modify the
+            # model.
+            self.scaler.scale(loss["loss"]).backward()
+            self.scaler.unscale_(self.optimizer)
+            for parameter in self.grad_vars:
+                if parameter.grad is None:
+                    continue
+                gradient = parameter.grad.detach()
+                gradients_finite = gradients_finite and bool(
+                    torch.isfinite(gradient).all().item()
+                )
+                gradient_norms.append(torch.linalg.vector_norm(gradient.float()))
+
+        if gradient_norms:
+            stacked_gradient_norms = torch.stack(gradient_norms)
+            if torch.isfinite(stacked_gradient_norms).all():
+                gradient_norm = float(
+                    torch.linalg.vector_norm(stacked_gradient_norms).item()
+                )
+            else:
+                gradient_norm = float("nan")
+                gradients_finite = False
+        else:
+            gradient_norm = 0.0 if losses_finite else float("nan")
+
+        optimizer_step_safe = (
+            losses_finite
+            and gradients_finite
+            and np.isfinite(gradient_norm)
+        )
+        if optimizer_step_safe:
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+
+        # Never feed NaN gradients to AdamW. This is particularly important
+        # when AMP is disabled, because there is then no GradScaler safeguard.
         scale_after = float(self.scaler.get_scale())
         parameter_probe_delta = float(
             torch.max(
@@ -979,8 +1062,7 @@ class Trainer:
             ).item()
         )
         amp_step_skipped = (
-            not gradients_finite
-            or not np.isfinite(gradient_norm)
+            not optimizer_step_safe
             or scale_after < scale_before
         )
 
@@ -993,6 +1075,7 @@ class Trainer:
         )
 
         diagnostics.update({
+            "losses_finite": bool(losses_finite),
             "gradient_norm": gradient_norm,
             "gradients_finite": bool(gradients_finite),
             "parameter_probe_max_delta": parameter_probe_delta,

@@ -1,0 +1,13 @@
+astra-toolbox
+imageio
+kornia
+matplotlib
+ninja
+numpy
+odl
+pandas
+pillow
+pyyaml
+scikit-image
+scipy
+tqdm

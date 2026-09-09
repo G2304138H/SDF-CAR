@@ -26,6 +26,24 @@ def require_differentiable_distance_transform():
         )
 
 
+def scheduled_loss_weight(base_weight, epoch, warmup_epochs=0, ramp_epochs=0):
+    """Return a loss weight after an optional zero-weight warm-up and ramp."""
+    base_weight = float(base_weight)
+    epoch = int(epoch)
+    warmup_epochs = int(warmup_epochs)
+    ramp_epochs = int(ramp_epochs)
+    if not math.isfinite(base_weight) or base_weight < 0.0:
+        raise ValueError("base_weight must be finite and non-negative.")
+    if epoch < 0 or warmup_epochs < 0 or ramp_epochs < 0:
+        raise ValueError("epoch, warmup_epochs, and ramp_epochs must be non-negative.")
+    if base_weight == 0.0 or epoch <= warmup_epochs:
+        return 0.0
+    if ramp_epochs == 0:
+        return base_weight
+    ramp_fraction = min((epoch - warmup_epochs) / ramp_epochs, 1.0)
+    return base_weight * ramp_fraction
+
+
 def ray_integral_to_binary_probability(ray_integrals, attenuation=1.0):
     """Map non-negative ray lengths to silhouette probabilities in FP32.
 
@@ -58,7 +76,12 @@ def sdf_to_occupancy(sdf, alpha=50.0):
     return occupancy
 
 
-def occupancy_to_sdf_2d(occupancy_2d, voxel_size=1.0, use_kornia=True):
+def occupancy_to_sdf_2d(
+    occupancy_2d,
+    voxel_size=1.0,
+    use_kornia=True,
+    distance_epsilon=1.0e-6,
+):
     """
     Convert 2D occupancy/projection to 2D SDF using distance transform.
     
@@ -66,6 +89,9 @@ def occupancy_to_sdf_2d(occupancy_2d, voxel_size=1.0, use_kornia=True):
         occupancy_2d: 2D projection tensor [batch, height, width] or [height, width]
         voxel_size: Physical size of pixels for distance calculation
         use_kornia: Use differentiable kornia distance transform if available (default: True)
+        distance_epsilon: Soft-mask bound used before Kornia's logarithmic
+            transform. This prevents finite forward values with NaN gradients
+            at exact-zero or exact-one projection pixels.
         
     Returns:
         sdf_2d: 2D SDF tensor (negative inside, positive outside)
@@ -79,13 +105,33 @@ def occupancy_to_sdf_2d(occupancy_2d, voxel_size=1.0, use_kornia=True):
     
     # Use differentiable kornia implementation if available and requested
     if KORNIA_AVAILABLE and use_kornia:
+        distance_epsilon = float(distance_epsilon)
+        if (
+            not math.isfinite(distance_epsilon)
+            or distance_epsilon <= 0.0
+            or distance_epsilon >= 0.5
+        ):
+            raise ValueError(
+                "distance_epsilon must be finite and strictly between 0 and 0.5."
+            )
+
         # Kornia defines DT(image) as distance to the nearest non-zero pixel.
         # Keeping this mask soft preserves the gradient from the geometric loss
         # back to the projected volume.  A hard ``> 0.5`` conversion here would
         # sever that gradient entirely. Keep the transform in FP32 since its
         # iterative exponentials are numerically fragile in mixed precision.
+        # Kornia internally evaluates ``-h * log(filtered_mask)``. Exact-zero
+        # detector pixels therefore create an infinite local derivative even
+        # though Kornia sanitizes its forward output with ``nan_to_num``. Bound
+        # both sides of the soft mask so its backward pass stays finite.
         with torch.amp.autocast(device_type=device.type, enabled=False):
-            soft_mask = occupancy_2d.float().clamp(0.0, 1.0).unsqueeze(1)
+            numerical_epsilon = max(
+                distance_epsilon,
+                float(torch.finfo(torch.float32).eps),
+            )
+            soft_mask = occupancy_2d.float().clamp(
+                numerical_epsilon, 1.0 - numerical_epsilon
+            ).unsqueeze(1)
 
             # Positive outside and negative inside.  For a binary input,
             # DT(mask) is zero inside and positive outside; DT(1-mask) is the

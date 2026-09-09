@@ -42,26 +42,35 @@ Our method successfully captures fine distal branches that are often missed by o
 
 ## 🛠️ Installation
 
-This code is based on PyTorch and requires a GPU with CUDA support.
+This code is based on PyTorch and requires Linux with an NVIDIA GPU, a recent
+CUDA-capable driver, the CUDA toolkit/`nvcc` for the bundled hash-grid extension,
+and Python 3.10 or newer. Conda is not required.
 
 ```bash
-# 1. Navigate to the project directory
+# 1. Create and activate a standard Python virtual environment
 cd SDF-CAR
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip setuptools wheel
 
-# 2. Create a conda environment
-conda create -n sdf-car python=3.8
-conda activate sdf-car
+# 2. Install a CUDA-enabled PyTorch wheel
+# Choose the wheel supported by your NVIDIA driver from https://pytorch.org/get-started/locally/.
+# Example for a driver supporting CUDA 12.6:
+python -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
 
-# 3. Install PyTorch (Adjust CUDA version as needed)
-conda install pytorch torchvision torchaudio pytorch-cuda=11.8 -c pytorch -c nvidia
+# 3. Install this repository's remaining Python dependencies
+python -m pip install -r requirements.txt
 
-# 4. Install required dependencies
-pip install numpy scipy pyyaml tqdm matplotlib pandas scikit-image imageio pillow kornia
-pip install odl tigre
-
-# 5. (Optional) Install tiny-cuda-nn for hash encoding acceleration
-pip install git+https://github.com/NVlabs/tiny-cuda-nn/#subdirectory=bindings/torch
+# 4. Verify the GPU packages before training
+python -c "import torch, astra; print(torch.__version__, torch.version.cuda, torch.cuda.is_available()); astra.test()"
+nvcc --version
 ```
+
+The host's installed CUDA toolkit need not exactly equal PyTorch's wheel label;
+the NVIDIA driver must support the wheel's runtime. If `nvidia-smi` reports only
+CUDA 12.5 support, select a CUDA 12.4 PyTorch build from the
+[official previous-versions page](https://pytorch.org/get-started/previous-versions/)
+instead of the `cu126` example.
 
 ## 📂 Data Preparation
 
@@ -183,6 +192,14 @@ parameter-probe change, AMP scale, and whether AMP skipped the optimizer step.
 The console prints the same critical values. If the gradient is dead for
 `train.zero_gradient_patience` consecutive epochs, training aborts and points
 to this log instead of completing a meaningless constant-loss run.
+
+Kornia's soft distance transform contains a logarithm, so the trainer bounds
+its input with `train.sdf_distance_epsilon` (default `1e-6`) to keep gradients
+finite at exact-zero detector margins. The geometric SDF loss is disabled for
+`train.sdf_loss_warmup_epochs` (default 100) while the projection term forms a
+silhouette, then reaches its configured weight over
+`train.sdf_loss_ramp_epochs` (default 400). The effective weight is printed and
+written to the JSONL log each epoch. A non-finite epoch never updates AdamW.
 
 During output evaluation, `reference_volume_npz` maps the centred reconstruction
 ROI back to the reference XYZ grid and supplies the GT mask for DSC.

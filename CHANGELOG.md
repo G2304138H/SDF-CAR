@@ -1,5 +1,19 @@
 # Change log
 
+## 2026-09-09 — First-epoch non-finite-gradient fix
+
+- Bound Kornia soft distance-transform inputs to `[1e-6, 1 - 1e-6]`.
+  Kornia internally computes a logarithm; exact-zero detector margins could
+  have finite sanitized forward values but non-finite derivatives.
+- Run the first 100 epochs with projection loss only, then linearly ramp the
+  2D SDF weight over 400 epochs. This stabilizes initialization and makes an
+  epoch-one failure specifically identify the ODL/ASTRA projection path.
+- Skip the AdamW update whenever the loss or any gradient is non-finite, so a
+  failed diagnostic epoch cannot corrupt the network parameters.
+- Log the effective SDF weight and the new epsilon/warm-up/ramp settings in
+  `training_log_<case>.jsonl`; the raised error now states whether Kornia was
+  present in the failing backward graph.
+
 ## 2026-09-09 — Trainer gradient-collapse fix
 
 - Initialize SDF output with a configurable positive bias (`0.1` by default),

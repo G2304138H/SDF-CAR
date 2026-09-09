@@ -35,6 +35,11 @@ train:
   sdf_alpha: 50.0  # Sharpness parameter for SDF to occupancy conversion
   minimum_gradient_norm: 0.000000000001
   zero_gradient_patience: 20
+  # Kornia uses a logarithmic soft distance transform. Keep exact-zero/one
+  # pixels away from log(0), then introduce its loss after projection fitting.
+  sdf_distance_epsilon: 0.000001
+  sdf_loss_warmup_epochs: 100
+  sdf_loss_ramp_epochs: 400
   # Camera noise parameters for robustness testing
   camera_noise_enabled: false  # Enable/disable camera extrinsic noise
   camera_position_noise_std: 0.0  # Position noise std in mm

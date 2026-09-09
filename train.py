@@ -6,6 +6,7 @@ import numpy as np
 from src.trainer import Trainer
 from src.render import run_network
 from src.config.configloading import load_config
+from src.render.sdf_utils import scheduled_loss_weight
 
 def config_parser():
     parser = argparse.ArgumentParser()
@@ -67,6 +68,12 @@ class BasicTrainer(Trainer):
         
         print(f"SDF Mode: {self.use_sdf}, Alpha: {self.sdf_alpha}")
         print(f"Loss Weights - Projection: {self.projection_weight}, SDF: {self.sdf_loss_weight}")
+        print(
+            "SDF stability - epsilon: "
+            f"{self.sdf_distance_epsilon:g}, projection-only warm-up: "
+            f"{self.sdf_loss_warmup_epochs} epochs, ramp: "
+            f"{self.sdf_loss_ramp_epochs} epochs"
+        )
         
         # Best model tracking
         self.best_loss = float('inf')
@@ -115,7 +122,13 @@ class BasicTrainer(Trainer):
             projection_loss = self.l2_loss(train_projs, projs.float())
 
         sdf_2d_loss = projs.new_zeros(())
-        if (self.sdf_loss_weight > 0 and
+        effective_sdf_weight = scheduled_loss_weight(
+            self.sdf_loss_weight,
+            self.current_epoch,
+            self.sdf_loss_warmup_epochs,
+            self.sdf_loss_ramp_epochs,
+        )
+        if (effective_sdf_weight > 0 and
             hasattr(data, 'sdf_projs') and data.sdf_projs is not None):
 
             detector_pixel_size = self.dataconfig["dDetector"][0]
@@ -124,10 +137,12 @@ class BasicTrainer(Trainer):
             # Reuse the projections already computed for the occupancy loss.
             # This avoids two extra ASTRA forward projections per epoch.
             sdf_2d_view1 = occupancy_to_sdf_2d(
-                train_projs[0, 0], voxel_size=detector_pixel_size
+                train_projs[0, 0], voxel_size=detector_pixel_size,
+                distance_epsilon=self.sdf_distance_epsilon,
             )
             sdf_2d_view2 = occupancy_to_sdf_2d(
-                train_projs[0, 1], voxel_size=detector_pixel_size
+                train_projs[0, 1], voxel_size=detector_pixel_size,
+                distance_epsilon=self.sdf_distance_epsilon,
             )
             pred_sdf_2d = torch.stack(
                 [sdf_2d_view1, sdf_2d_view2], dim=0
@@ -141,11 +156,14 @@ class BasicTrainer(Trainer):
                 )
 
         total_loss = (self.projection_weight * projection_loss +
-                      self.sdf_loss_weight * sdf_2d_loss)
+                      effective_sdf_weight * sdf_2d_loss)
 
         loss["loss"] = total_loss
         loss["projection_loss"] = projection_loss
         loss["sdf_2d_loss"] = sdf_2d_loss
+        loss["sdf_2d_effective_weight"] = projection_loss.new_tensor(
+            effective_sdf_weight
+        )
         loss["occupancy_min"] = train_output_occupancy.detach().amin()
         loss["occupancy_max"] = train_output_occupancy.detach().amax()
         loss["raw_projection_min"] = raw_train_projs.detach().amin()

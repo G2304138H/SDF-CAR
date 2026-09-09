@@ -61,6 +61,11 @@ train:
   sdf_alpha: 50.0
   minimum_gradient_norm: 0.000000000001
   zero_gradient_patience: 20
+  # Stabilize Kornia's logarithmic distance-transform backward pass and let
+  # the projection loss first establish a non-degenerate silhouette.
+  sdf_distance_epsilon: 0.000001
+  sdf_loss_warmup_epochs: 100
+  sdf_loss_ramp_epochs: 400
   # Used only for direct binary-mask inputs. The generated line-integral NPZ
   # bypasses this transform and matches the original SDF-CAR projection loss.
   projection_attenuation: 1.0
