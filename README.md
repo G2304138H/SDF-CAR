@@ -56,7 +56,7 @@ conda activate sdf-car
 conda install pytorch torchvision torchaudio pytorch-cuda=11.8 -c pytorch -c nvidia
 
 # 4. Install required dependencies
-pip install numpy scipy pyyaml tqdm matplotlib pandas
+pip install numpy scipy pyyaml tqdm matplotlib pandas scikit-image imageio pillow
 pip install odl tigre
 
 # 5. (Optional) Install tiny-cuda-nn for hash encoding acceleration
@@ -131,6 +131,14 @@ compared with `reference_volume_npz["vol"] > 0`. The voxel mask Dice score
 `2 * intersection / (prediction + reference)` is printed and saved as
 `mask_dsc` in both the reconstruction NPZ and timing JSON. Foreground and
 intersection voxel counts are saved alongside it for verification.
+
+Visual quality-control artifacts are also generated after direct optimization:
+`predicted_projection_view_<index>.png` for each selected input camera, plus
+`3d_ground_truth_surface.gif` and `3d_prediction_surface.gif` when a reference
+volume is available. The two surface GIFs match the parametric evaluator's
+single-surface camera path (24 frames, 5 FPS, one 360-degree azimuth rotation,
+with sinusoidal elevation from 16 to 28 degrees). These settings can be changed
+under `visualization` in the case YAML.
 
 Direct optimization still requires an NVIDIA CUDA system: the hash-grid
 encoder compiles a CUDA extension and the forward projector uses

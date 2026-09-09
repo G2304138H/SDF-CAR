@@ -32,6 +32,14 @@ encoder:
 render:
   netchunk: 699060
 
+visualization:
+  save_predicted_projection_pngs: true
+  save_surface_gifs: true
+  # Match the parametric evaluator's single-surface GIF trajectory and speed.
+  surface_gif_frames: 24
+  surface_gif_fps: 5
+  surface_gif_max_faces: 200000
+
 train:
   epoch: 5000
   lrate: 0.0001
