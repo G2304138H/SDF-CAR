@@ -65,7 +65,17 @@ def build_conebeam_gemotry(param):
                                     dtype='float32')
     
     if np.isclose(param.param['start_angle'], param.param['end_angle']):
-        angle_partition = odl.nonuniform_partition([param.param['start_angle']])
+        # A nonuniform partition made from one coordinate has zero extent.
+        # RayTransform turns that extent into its range-space weighting and
+        # rejects the resulting zero constant.  Use one positive-width cell
+        # centred on the requested angle; its sole sampling point is still
+        # exactly ``start_angle``.
+        half_cell_width = 0.5
+        angle_partition = odl.uniform_partition(
+            min_pt=param.param['start_angle'] - half_cell_width,
+            max_pt=param.param['start_angle'] + half_cell_width,
+            shape=1,
+        )
     else:
         angle_partition = odl.uniform_partition(min_pt=param.param['start_angle'],
                                                 max_pt=param.param['end_angle'],
@@ -188,7 +198,6 @@ class ConeBeam3DProjector():
         volume = self.fbp(projs)
 
         return volume
-
 
 
 
