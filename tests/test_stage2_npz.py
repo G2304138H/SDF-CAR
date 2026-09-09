@@ -9,7 +9,9 @@ from src.dataset.stage2_npz import (
     embed_roi_mask_in_reference_grid,
     extract_reference_grid_roi,
     load_stage2_projection_case,
+    sdfcar_angles_to_central_ray,
     stage2_angles_to_camera_frames,
+    stage2_angles_to_sdfcar_angles,
 )
 
 
@@ -63,6 +65,50 @@ class Stage2NpzTest(unittest.TestCase):
         np.testing.assert_allclose(detector[0], [0.0, 0.0, 0.15], atol=1e-7)
         np.testing.assert_allclose(u_axis[0], [0.0, 1.0, 0.0], atol=1e-7)
         np.testing.assert_allclose(v_axis[0], [-1.0, 0.0, 0.0], atol=1e-7)
+
+    def test_stage2_angles_map_to_the_same_sdfcar_central_rays(self):
+        theta = np.asarray([-40.0, 75.0], dtype=np.float32)
+        phi = np.asarray([80.0, 80.0], dtype=np.float32)
+        converted = stage2_angles_to_sdfcar_angles(theta, phi)
+        np.testing.assert_allclose(
+            converted,
+            [[-10.0, 130.0], [-10.0, 15.0]],
+            atol=1e-6,
+        )
+
+        source, detector, _, _ = stage2_angles_to_camera_frames(
+            theta, phi, 0.9, 0.75
+        )
+        stage2_rays = detector - source
+        stage2_rays /= np.linalg.norm(stage2_rays, axis=1, keepdims=True)
+        np.testing.assert_allclose(
+            stage2_rays,
+            [
+                [0.75440651, -0.63302219, 0.17364816],
+                [0.25488701, 0.95125127, 0.17364816],
+            ],
+            atol=1e-6,
+        )
+        np.testing.assert_allclose(
+            sdfcar_angles_to_central_ray(converted),
+            stage2_rays,
+            atol=1e-6,
+        )
+
+    def test_camera_frame_keeps_detector_roll_for_odl(self):
+        source, detector, u_axis, v_axis = stage2_angles_to_camera_frames(
+            np.asarray([-40.0, 75.0]),
+            np.asarray([80.0, 80.0]),
+            0.9,
+            0.75,
+        )
+        rays = detector - source
+        rays /= np.linalg.norm(rays, axis=1, keepdims=True)
+        np.testing.assert_allclose(np.linalg.norm(u_axis, axis=1), 1.0, atol=1e-7)
+        np.testing.assert_allclose(np.linalg.norm(v_axis, axis=1), 1.0, atol=1e-7)
+        np.testing.assert_allclose(np.sum(rays * u_axis, axis=1), 0.0, atol=1e-7)
+        np.testing.assert_allclose(np.sum(rays * v_axis, axis=1), 0.0, atol=1e-7)
+        np.testing.assert_allclose(np.sum(u_axis * v_axis, axis=1), 0.0, atol=1e-7)
 
     def test_embeds_centered_roi_in_reference_grid(self):
         roi = np.ones((3, 3, 3), dtype=np.uint8)

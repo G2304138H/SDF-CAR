@@ -10,6 +10,9 @@ from .stage2_npz import (
     embed_roi_mask_in_reference_grid,
     extract_reference_grid_roi,
     load_stage2_projection_case,
+    sdfcar_angles_to_central_ray,
+    stage2_angles_to_camera_frames,
+    stage2_angles_to_sdfcar_angles,
     validate_view_indices,
 )
 
@@ -29,5 +32,8 @@ __all__ = [
     "embed_roi_mask_in_reference_grid",
     "extract_reference_grid_roi",
     "load_stage2_projection_case",
+    "sdfcar_angles_to_central_ray",
+    "stage2_angles_to_camera_frames",
+    "stage2_angles_to_sdfcar_angles",
     "validate_view_indices",
 ]

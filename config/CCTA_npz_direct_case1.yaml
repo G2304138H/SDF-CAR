@@ -1,0 +1,58 @@
+exp:
+  dataconfig: ./config/config.yml
+  # Direct reconstruction from the segmented masks and theta/phi stored here.
+  # No 3D volume is read by the optimizer and no projection generator is run.
+  projection_npz: /Users/renyu/Downloads/2d_1.npz
+  # Optional: used only after optimization for full-grid output and GT DSC.
+  reference_volume_npz: /Users/renyu/Downloads/voxel_1.npz
+  output_recon_dir: ./logs/reconstructions_npz/
+  current_model_id: rca_0001_input_views_0_1
+  view_indices: [0, 1]
+  source_origin_distance_m: 0.75
+  reconstruction_nVoxel: [128, 128, 128]
+  # null derives the isocentre FOV from image width, pixel spacing, SID and DSO.
+  reconstruction_extent_m: null
+  output_occupancy_threshold: 0.5
+
+network:
+  net_type: mlp
+  num_layers: 8
+  hidden_dim: 256
+  skips: [4]
+  out_dim: 1
+  bound: 0.3
+  use_gradient_checkpointing: true
+
+encoder:
+  encoding: hashgrid
+  input_dim: 3
+  num_levels: 16
+  level_dim: 2
+  base_resolution: 16
+  log2_hashmap_size: 19
+
+render:
+  netchunk: 699060
+
+visualization:
+  save_predicted_projection_pngs: true
+  save_surface_gifs: true
+  surface_gif_frames: 24
+  surface_gif_fps: 5
+  surface_gif_max_faces: 200000
+
+train:
+  epoch: 5000
+  lrate: 0.0001
+  mixed_precision: true
+  weight_decay: 0.000001
+  memory_efficient_eval: true
+  use_sdf: true
+  sdf_alpha: 50.0
+  # The supplied images are binary masks, so rendered ray lengths are mapped
+  # to differentiable ray-occupancy probabilities before comparison.
+  projection_attenuation: 1.0
+  current_loss_weights: [0.25, 1.0]
+  camera_noise_enabled: false
+  camera_position_noise_std: 0.0
+  camera_orientation_noise_std: 0.0

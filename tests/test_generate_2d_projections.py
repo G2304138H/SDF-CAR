@@ -78,6 +78,23 @@ class Generate2DProjectionsTest(unittest.TestCase):
                     int(np.count_nonzero(generated["reference_roi_mask_xyz"])),
                     27,
                 )
+                np.testing.assert_allclose(
+                    generated["sdfcar_projection_angles_deg"],
+                    [[-10.0, 130.0], [-10.0, 15.0]],
+                    atol=1e-6,
+                )
+                self.assertEqual(
+                    generated["odl_source_to_detector_unit_xyz"].shape,
+                    (2, 3),
+                )
+                self.assertEqual(
+                    generated["odl_detector_row_axis_xyz"].shape,
+                    (2, 3),
+                )
+                self.assertEqual(
+                    generated["odl_detector_column_axis_xyz"].shape,
+                    (2, 3),
+                )
 
 
 if __name__ == "__main__":

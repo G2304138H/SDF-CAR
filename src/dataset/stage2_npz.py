@@ -76,6 +76,24 @@ class Stage2ProjectionCase:
             dtype=np.float32,
         )
 
+    def sdfcar_projection_angles_deg(
+        self, view_indices: Optional[Sequence[int]] = None
+    ) -> np.ndarray:
+        """Return direction-equivalent pairs used by the SDF-CAR YAML.
+
+        These pairs preserve the central ray.  The complete ODL camera still
+        needs the detector U/V axes returned by :meth:`camera_frames` in order
+        to preserve the input image's in-plane orientation.
+        """
+        indices = (
+            np.arange(self.num_views, dtype=np.int64)
+            if view_indices is None
+            else validate_view_indices(view_indices, self.num_views)
+        )
+        return stage2_angles_to_sdfcar_angles(
+            self.theta_deg[indices], self.phi_deg[indices]
+        )
+
 
 def _scalar(npz: np.lib.npyio.NpzFile, key: str) -> object:
     return np.asarray(npz[key]).reshape(()).item()
@@ -290,6 +308,63 @@ def stage2_angles_to_camera_frames(
     )
 
 
+def stage2_angles_to_sdfcar_angles(
+    theta_deg: np.ndarray,
+    phi_deg: np.ndarray,
+) -> np.ndarray:
+    """Convert Stage-2 ``theta/phi`` to SDF-CAR's two-angle convention.
+
+    SDF-CAR stores a pair ``[A, B]`` and internally constructs its ray as
+
+    ``[cos(A) sin(B), cos(A) cos(B), -sin(A)]``.
+
+    Stage-2's central ray is the usual spherical direction
+
+    ``[sin(phi) cos(theta), sin(phi) sin(theta), cos(phi)]``.
+
+    Equating those expressions gives ``A = phi - 90`` and
+    ``B = 90 - theta`` (degrees).  The returned second angle is wrapped to
+    ``[-180, 180)`` for stable, human-readable metadata.
+
+    This conversion intentionally describes only the central ray.  Use
+    :func:`stage2_angles_to_camera_frames` when constructing an ODL camera so
+    the detector axes (and therefore image roll) remain exact.
+    """
+    theta = np.asarray(theta_deg, dtype=np.float64)
+    phi = np.asarray(phi_deg, dtype=np.float64)
+    if theta.shape != phi.shape:
+        raise ValueError("theta_deg and phi_deg must have the same shape.")
+    if not np.isfinite(theta).all() or not np.isfinite(phi).all():
+        raise ValueError("theta_deg and phi_deg must be finite.")
+
+    first = phi - 90.0
+    second = np.mod(90.0 - theta + 180.0, 360.0) - 180.0
+    return np.stack((first, second), axis=-1).astype(np.float32)
+
+
+def sdfcar_angles_to_central_ray(angles_deg: np.ndarray) -> np.ndarray:
+    """Return SDF-CAR's source-to-detector unit ray for ``[..., 2]`` pairs."""
+    angles = np.asarray(angles_deg, dtype=np.float64)
+    if angles.ndim < 1 or angles.shape[-1] != 2:
+        raise ValueError(
+            f"angles_deg must have shape [...,2], got {angles.shape}."
+        )
+    if not np.isfinite(angles).all():
+        raise ValueError("angles_deg must be finite.")
+
+    first = np.deg2rad(angles[..., 0])
+    second = np.deg2rad(angles[..., 1])
+    rays = np.stack(
+        (
+            np.cos(first) * np.sin(second),
+            np.cos(first) * np.cos(second),
+            -np.sin(first),
+        ),
+        axis=-1,
+    )
+    return rays.astype(np.float32)
+
+
 def embed_roi_mask_in_reference_grid(
     roi_mask_xyz: np.ndarray,
     *,
@@ -438,6 +513,8 @@ __all__ = [
     "embed_roi_mask_in_reference_grid",
     "extract_reference_grid_roi",
     "load_stage2_projection_case",
+    "sdfcar_angles_to_central_ray",
     "stage2_angles_to_camera_frames",
+    "stage2_angles_to_sdfcar_angles",
     "validate_view_indices",
 ]

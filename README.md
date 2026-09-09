@@ -131,6 +131,38 @@ uses the reference 3D mask to create the 2D targets, so it must not be reported
 as real two-view inference. For real inference, point `exp.projection_npz`
 directly at the acquired/segmented view NPZ and do not run the generator.
 
+For the supplied `2d_1.npz`, a direct two-view configuration is provided:
+
+```bash
+python train.py --config config/CCTA_npz_direct_case1.yaml
+```
+
+This selects views 0 and 1 from the input NPZ and uses their masks directly;
+`voxel_1.npz` is consulted only after optimization for full-grid output and
+DSC. Change the two absolute NPZ paths after cloning on another machine.
+
+Camera conversion is performed in the centred XYZ reference frame used by
+ODL. A Stage-2 pair `(theta, phi)` has central ray
+`[sin(phi)cos(theta), sin(phi)sin(theta), cos(phi)]`. Its direction-equivalent
+SDF-CAR YAML pair is `[phi - 90, 90 - theta]` degrees. The selected supplied
+views therefore map as follows:
+
+```text
+theta=-40, phi=80 -> SDF-CAR [-10, 130]
+theta= 75, phi=80 -> SDF-CAR [-10,  15]
+```
+
+Training passes the complete camera frame to `ODL ConeBeamGeometry`: the
+source-to-detector direction plus detector row and column axes. The two-angle
+values are saved for audit, but are not used alone because they cannot preserve
+detector roll. The reconstruction NPZ records these as
+`sdfcar_projection_angles_deg`, `odl_source_to_detector_unit_xyz`,
+`odl_detector_row_axis_xyz`, and `odl_detector_column_axis_xyz`.
+
+The one-view ODL motion partition is centred on the requested angle. This fixes
+an upstream issue where `uniform_partition(0, requested_angle, shape=1)` samples
+the midpoint (`requested_angle / 2`) rather than the requested view.
+
 During output evaluation, `reference_volume_npz` maps the centred reconstruction
 ROI back to the reference XYZ grid and supplies the GT mask for DSC.
 

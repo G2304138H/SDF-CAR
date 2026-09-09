@@ -258,6 +258,12 @@ def generate_projection_npz(
             f"an unusable training input. Counts: {selected_foreground}."
         )
 
+    source, detector, u_axis, v_axis = camera_case.camera_frames()
+    source_to_detector = detector - source
+    source_to_detector /= np.linalg.norm(
+        source_to_detector, axis=1, keepdims=True
+    )
+
     payload = {
         "sample_name": np.asarray(f"{camera_case.sample_name}_from_reference_voxel"),
         # Raw ray lengths match the original SDF-CAR synthetic-projection path.
@@ -267,7 +273,15 @@ def generate_projection_npz(
         "projection_representation": np.asarray("line_integral_mm"),
         "theta_deg": camera_case.theta_deg.astype(np.float32),
         "phi_deg": camera_case.phi_deg.astype(np.float32),
+        "sdfcar_projection_angles_deg": (
+            camera_case.sdfcar_projection_angles_deg()
+        ),
         "clinical_views": camera_case.clinical_views,
+        "odl_source_xyz_m": source,
+        "odl_detector_center_xyz_m": detector,
+        "odl_source_to_detector_unit_xyz": source_to_detector,
+        "odl_detector_row_axis_xyz": v_axis,
+        "odl_detector_column_axis_xyz": u_axis,
         "sid": np.asarray(camera_case.sid_m, dtype=np.float32),
         "imager_pixel_spacing": np.asarray(
             camera_case.detector_pixel_spacing_m * 1000.0, dtype=np.float32

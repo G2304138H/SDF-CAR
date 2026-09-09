@@ -151,10 +151,18 @@ class Trainer:
                 f"{case.projection_representation}"
             )
             print(f"Selected views: {view_indices.tolist()}")
-            for index in view_indices:
+            equivalent_angles = case.sdfcar_projection_angles_deg(view_indices)
+            selected_source, selected_detector, _, _ = case.camera_frames(view_indices)
+            selected_rays = selected_detector - selected_source
+            selected_rays /= np.linalg.norm(selected_rays, axis=1, keepdims=True)
+            for view_position, index in enumerate(view_indices):
                 print(
                     f"  {int(index)}: {case.clinical_views[index]} | "
-                    f"theta={case.theta_deg[index]:g}, phi={case.phi_deg[index]:g}"
+                    f"theta={case.theta_deg[index]:g}, phi={case.phi_deg[index]:g} | "
+                    "SDF-CAR direction pair="
+                    f"{equivalent_angles[view_position].tolist()} | "
+                    "ODL source-to-detector ray="
+                    f"{selected_rays[view_position].astype(float).tolist()}"
                 )
 
         # Setup data paths from main config (CCTA.yaml) - much cleaner!
@@ -557,6 +565,13 @@ class Trainer:
     def _save_external_reconstruction_npz(self, sdf_roi, occupancy_roi):
         """Save ROI fields and a reference-grid binary volume in one NPZ."""
         case = self.external_projection_case
+        source, detector, u_axis, v_axis = case.camera_frames(
+            self.external_view_indices
+        )
+        source_to_detector = detector - source
+        source_to_detector /= np.linalg.norm(
+            source_to_detector, axis=1, keepdims=True
+        )
         threshold = float(
             self.conf.get("exp", {}).get("output_occupancy_threshold", 0.5)
         )
@@ -581,8 +596,18 @@ class Trainer:
             "view_indices": self.external_view_indices.astype(np.int32),
             "theta_deg": case.theta_deg[self.external_view_indices],
             "phi_deg": case.phi_deg[self.external_view_indices],
+            "sdfcar_projection_angles_deg": (
+                case.sdfcar_projection_angles_deg(self.external_view_indices)
+            ),
             "clinical_views": case.clinical_views[self.external_view_indices],
             "input_images": case.images[self.external_view_indices],
+            # Exact centred ODL camera frame. Detector array rows follow V and
+            # columns follow U, matching the Stage-2 raster convention.
+            "odl_source_xyz_m": source,
+            "odl_detector_center_xyz_m": detector,
+            "odl_source_to_detector_unit_xyz": source_to_detector,
+            "odl_detector_row_axis_xyz": v_axis,
+            "odl_detector_column_axis_xyz": u_axis,
             "projection_center_offset_m": center_m,
             "sid_m": np.asarray(case.sid_m, dtype=np.float32),
             "source_origin_distance_m": np.asarray(
