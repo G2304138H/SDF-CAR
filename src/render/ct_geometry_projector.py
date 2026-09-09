@@ -6,7 +6,8 @@ import odl
 from odl.contrib import torch as odl_torch
 
 class Initialization_ConeBeam:
-    def __init__(self, image_size, image_reso, proj_angle, proj_axis, proj_size, proj_reso, dde, dso):
+    def __init__(self, image_size, image_reso, proj_angle, proj_axis, proj_size,
+                 proj_reso, dde, dso, src_to_det_init=None, det_axes_init=None):
         '''
         image_size: [z, x, y], assume x = y for each slice image
         proj_size: [h, w]
@@ -23,6 +24,14 @@ class Initialization_ConeBeam:
         self.proj_axis = proj_axis
         self.dde = dde
         self.dso = dso
+        self.src_to_det_init = (
+            (0, 1, 0) if src_to_det_init is None else tuple(src_to_det_init)
+        )
+        self.det_axes_init = (
+            [(1, 0, 0), (0, 0, 1)]
+            if det_axes_init is None
+            else [tuple(axis) for axis in det_axes_init]
+        )
         
         #self.reso = 512. / image_size[1] * raw_reso
 
@@ -55,9 +64,12 @@ def build_conebeam_gemotry(param):
                                     shape=[param.param['nx'], param.param['ny'], param.param['nz']],
                                     dtype='float32')
     
-    angle_partition = odl.uniform_partition(min_pt=param.param['start_angle'], 
-                                            max_pt=param.param['end_angle'],
-                                            shape=param.param['nProj'])
+    if np.isclose(param.param['start_angle'], param.param['end_angle']):
+        angle_partition = odl.nonuniform_partition([param.param['start_angle']])
+    else:
+        angle_partition = odl.uniform_partition(min_pt=param.param['start_angle'],
+                                                max_pt=param.param['end_angle'],
+                                                shape=param.param['nProj'])
 
     detector_partition = odl.uniform_partition(min_pt=[-(param.param['sh'] / 2.0), -(param.param['sw'] / 2.0)], 
                                                  max_pt=[(param.param['sh'] / 2.0), (param.param['sw'] / 2.0)],
@@ -68,20 +80,15 @@ def build_conebeam_gemotry(param):
                                           dpart=detector_partition, # partition of the detector parameter interval
                                           src_radius=param.param['dso'], # radius of the source circle
                                           det_radius=param.param['dde'], # radius of the detector circle
-                                          src_to_det_init=(0,1,0),
-                                          det_axes_init=[(1, 0, 0), (0, 0, 1)],
+                                          src_to_det_init=param.src_to_det_init,
+                                          det_axes_init=param.det_axes_init,
                                           axis=param.param['proj_axis']) # rotation axis is z-axis: (0, 0, 1)
     
     ray_trafo = odl.tomo.RayTransform(vol_space=reco_space, #domain=reco_space, # domain of forward projector
                                      geometry=geometry, # geometry of the transform
                                      impl='astra_cuda') # implementation back-end for the transform: ASTRA toolbox, using CUDA, 2D or 3D
     
-    FBPOper = odl.tomo.fbp_op(ray_trafo=ray_trafo, 
-                             filter_type='Ram-Lak',
-                             frequency_scaling=1.0)
-    
-    # Reconstruction space for imaging object, RayTransform operator, Filtered back-projection operator
-    return ray_trafo, FBPOper
+    return ray_trafo
 
 
 # Projector
@@ -92,7 +99,7 @@ class Projection_ConeBeam(nn.Module):
         #self.reso = param.reso
         
         # RayTransform operator
-        ray_trafo, fbpOper = build_conebeam_gemotry(self.param)
+        ray_trafo = build_conebeam_gemotry(self.param)
         
         # Wrap pytorch module
         self.trafo = odl_torch.OperatorModule(ray_trafo)
@@ -115,7 +122,10 @@ class FBP_ConeBeam(nn.Module):
         self.param = param
         # self.reso = param.reso
         
-        ray_trafo, FBPOper = build_conebeam_gemotry(self.param)
+        ray_trafo = build_conebeam_gemotry(self.param)
+        FBPOper = odl.tomo.fbp_op(ray_trafo=ray_trafo,
+                                 filter_type='Ram-Lak',
+                                 frequency_scaling=1.0)
         
         self.fbp = odl_torch.OperatorModule(FBPOper)
 
@@ -128,7 +138,8 @@ class FBP_ConeBeam(nn.Module):
         return x_filter
 
 class ConeBeam3DProjector():
-    def __init__(self, image_size, image_reso, proj_angle, proj_axis, proj_size, proj_reso, dde, dso):
+    def __init__(self, image_size, image_reso, proj_angle, proj_axis, proj_size,
+                 proj_reso, dde, dso, src_to_det_init=None, det_axes_init=None):
         self.image_size = image_size
         self.image_reso = image_reso
         self.proj_size = proj_size
@@ -137,15 +148,24 @@ class ConeBeam3DProjector():
         self.proj_axis = proj_axis
         self.dde = dde
         self.dso = dso
+        self.src_to_det_init = src_to_det_init
+        self.det_axes_init = det_axes_init
 
         # Initialize required parameters for image, view, detector
-        geo_param = Initialization_ConeBeam(image_size, image_reso, proj_angle, proj_axis, proj_size, proj_reso, dde, dso)
+        geo_param = Initialization_ConeBeam(
+            image_size, image_reso, proj_angle, proj_axis, proj_size, proj_reso,
+            dde, dso, src_to_det_init=src_to_det_init,
+            det_axes_init=det_axes_init,
+        )
+        self.geo_param = geo_param
 
         # Forward projection function
         self.forward_projector = Projection_ConeBeam(geo_param)
 
-        # Filtered back-projection
-        self.fbp = FBP_ConeBeam(geo_param)
+        # Construct the sparse-view FBP only if a caller explicitly requests
+        # it.  Forward-only per-scene optimization does not use FBP, and a
+        # single zero-angle partition is not a meaningful FBP trajectory.
+        self.fbp = None
 
     def forward_project(self, volume):
         '''
@@ -163,11 +183,11 @@ class ConeBeam3DProjector():
             projs: torch tensor with input size (B, num_proj, proj_size_h, proj_size_w)
         '''
 
+        if self.fbp is None:
+            self.fbp = FBP_ConeBeam(self.geo_param)
         volume = self.fbp(projs)
 
         return volume
-
-
 
 
 

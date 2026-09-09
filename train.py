@@ -98,17 +98,7 @@ class BasicTrainer(Trainer):
                 train_output_occupancy = train_output
                 train_output_sdf = None
 
-            # Process projections sequentially to reduce peak memory usage
-            train_projs_one = self.ct_projector_first.forward_project(train_output_occupancy)
-            
-            # Clear intermediate tensors to free memory
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            
-            train_projs_two = self.ct_projector_second.forward_project(train_output_occupancy)
-            
-            # Concatenate projections
-            train_projs = torch.cat((train_projs_one, train_projs_two), 1)
+            train_projs = self.render_occupancy_projections(train_output_occupancy)
             
             # Main projection loss (occupancy-based)
             projection_loss = self.l2_loss(train_projs, projs.float())
@@ -120,20 +110,18 @@ class BasicTrainer(Trainer):
                 
                 detector_pixel_size = self.dataconfig["dDetector"][0]
                 
-                if self.use_sdf:
-                    # SDF mode: use existing pipeline (3D SDF -> occupancy -> 2D proj -> 2D SDF)
-                    from src.render.sdf_utils import sdf_3d_to_occupancy_to_sdf_2d
-                    pred_sdf_2d, _ = sdf_3d_to_occupancy_to_sdf_2d(
-                        train_output_sdf, self.ct_projector_first, self.ct_projector_second,
-                        alpha=self.sdf_alpha, voxel_size_2d=detector_pixel_size
-                    )
-                else:
-                    # Occupancy mode: convert 2D occupancy projections to 2D SDF
-                    from src.render.sdf_utils import occupancy_to_sdf_2d
-                    # train_projs is [batch, 2, H, W] containing the occupancy projections
-                    sdf_2d_view1 = occupancy_to_sdf_2d(train_projs[0, 0], voxel_size=detector_pixel_size)
-                    sdf_2d_view2 = occupancy_to_sdf_2d(train_projs[0, 1], voxel_size=detector_pixel_size)
-                    pred_sdf_2d = torch.stack([sdf_2d_view1, sdf_2d_view2], dim=0)[None, ...]  # [1, 2, H, W]
+                from src.render.sdf_utils import occupancy_to_sdf_2d
+                # Reuse the projections already computed for the occupancy loss.
+                # This avoids two extra ASTRA forward projections per epoch.
+                sdf_2d_view1 = occupancy_to_sdf_2d(
+                    train_projs[0, 0], voxel_size=detector_pixel_size
+                )
+                sdf_2d_view2 = occupancy_to_sdf_2d(
+                    train_projs[0, 1], voxel_size=detector_pixel_size
+                )
+                pred_sdf_2d = torch.stack(
+                    [sdf_2d_view1, sdf_2d_view2], dim=0
+                )[None, ...]
                 
                 sdf_2d_loss = self.l2_loss(pred_sdf_2d, data.sdf_projs.float())
             

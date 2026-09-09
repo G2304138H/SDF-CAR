@@ -11,6 +11,11 @@ from .network import get_network
 from .encoder import get_encoder
 from src.render import run_network
 from .dataset import TIGREDataset as Dataset
+from .dataset.stage2_npz import (
+    embed_roi_mask_in_reference_grid,
+    load_stage2_projection_case,
+    validate_view_indices,
+)
 
 from src.render.ct_geometry_projector import ConeBeam3DProjector
 from odl.tomo.util.utility import axis_rotation, rotation_matrix_from_to
@@ -56,6 +61,77 @@ class Trainer:
         with open(configPath, "r") as handle:
             data = yaml.safe_load(handle)
 
+        # The original release only supports a GT-volume path and synthesizes
+        # its two targets from that volume.  ``projection_npz`` activates the
+        # actual paper use case: optimize from external 2D masks and cameras.
+        projection_npz = cfg["exp"].get("projection_npz")
+        self.external_projection_case = None
+        self.external_view_indices = None
+        self.reference_volume_npz = cfg["exp"].get("reference_volume_npz")
+        self.binary_projection_targets = bool(projection_npz)
+        self.projection_attenuation = float(
+            cfg.get("train", {}).get("projection_attenuation", 1.0)
+        )
+
+        if projection_npz:
+            source_origin_distance_m = float(
+                cfg["exp"].get("source_origin_distance_m", 0.75)
+            )
+            case = load_stage2_projection_case(
+                projection_npz,
+                source_origin_distance_m=source_origin_distance_m,
+            )
+            view_indices = validate_view_indices(
+                cfg["exp"].get("view_indices", [0, 1]), case.num_views
+            )
+            if view_indices.size != 2:
+                raise ValueError(
+                    "This SDF-CAR trainer currently requires exactly two external "
+                    f"views, got {view_indices.tolist()}."
+                )
+
+            detector_h, detector_w = case.detector_shape
+            volume_size = np.asarray(
+                cfg["exp"].get("reconstruction_nVoxel", data["nVoxel"]),
+                dtype=np.int64,
+            )
+            if volume_size.shape == ():
+                volume_size = np.repeat(volume_size, 3)
+            if volume_size.shape != (3,) or np.any(volume_size <= 0):
+                raise ValueError(
+                    "exp.reconstruction_nVoxel must be a positive scalar or XYZ triple."
+                )
+            volume_extent_m = cfg["exp"].get("reconstruction_extent_m")
+            if volume_extent_m is None:
+                volume_extent_m = case.isocenter_fov_m
+            extent_m = np.asarray(volume_extent_m, dtype=np.float64)
+            if extent_m.shape == ():
+                extent_m = np.repeat(extent_m, 3)
+            if extent_m.shape != (3,) or np.any(extent_m <= 0.0):
+                raise ValueError(
+                    "exp.reconstruction_extent_m must be a positive scalar or XYZ triple."
+                )
+
+            data.update({
+                "numTrain": 2,
+                "DSD": [case.sid_m * 1000.0] * 2,
+                "DSO": [case.source_origin_distance_m * 1000.0] * 2,
+                "DDE": [case.detector_origin_distance_m * 1000.0] * 2,
+                "nDetector": [detector_h, detector_w],
+                "dDetector": [case.detector_pixel_spacing_m * 1000.0] * 2,
+                "nVoxel": volume_size.astype(int).tolist(),
+                "dVoxel": (extent_m * 1000.0 / volume_size).tolist(),
+            })
+            self.external_projection_case = case
+            self.external_view_indices = view_indices
+            print(f"External projection NPZ: {case.path}")
+            print(f"Selected views: {view_indices.tolist()}")
+            for index in view_indices:
+                print(
+                    f"  {int(index)}: {case.clinical_views[index]} | "
+                    f"theta={case.theta_deg[index]:g}, phi={case.phi_deg[index]:g}"
+                )
+
         # Setup data paths from main config (CCTA.yaml) - much cleaner!
         input_data_dir = cfg["exp"].get("input_data_dir", "./data/GT_volumes/")
         
@@ -66,11 +142,12 @@ class Trainer:
         
         print(f"Processing experiment {self.current_model_id}")
         print(f"Original model ID: {original_model_id}")
-        print(f"GT volume path: {gt_volume_path}")
-
-        # Check if ground truth volume exists
-        if not os.path.exists(gt_volume_path):
-            raise FileNotFoundError(f"Ground truth volume not found: {gt_volume_path}")
+        if self.external_projection_case is None:
+            print(f"GT volume path: {gt_volume_path}")
+            if not os.path.exists(gt_volume_path):
+                raise FileNotFoundError(f"Ground truth volume not found: {gt_volume_path}")
+        else:
+            print("GT volume is not used by optimization.")
 
         dsd = data["DSD"] # Distance Source Detector   mm   
         dso = data["DSO"] # Distance Source Origin      mm 
@@ -84,11 +161,13 @@ class Trainer:
         image_size = np.array(data["nVoxel"])  # number of voxels              (vx)
         image_reso = np.array(data["dVoxel"])  # size of each voxel            (mm)
    
-        first_proj_angle = [-data["first_projection_angle"][1], data["first_projection_angle"][0]]
-        second_proj_angle = [-data["second_projection_angle"][1], data["second_projection_angle"][0]]
+        if self.external_projection_case is None:
+            first_proj_angle = [-data["first_projection_angle"][1], data["first_projection_angle"][0]]
+            second_proj_angle = [-data["second_projection_angle"][1], data["second_projection_angle"][0]]
         
         # Apply camera noise if enabled
-        if cfg.get("train", {}).get("camera_noise_enabled", False):
+        if (self.external_projection_case is None and
+                cfg.get("train", {}).get("camera_noise_enabled", False)):
             pos_noise_std = cfg.get("train", {}).get("camera_position_noise_std", 0.0)
             ori_noise_std = cfg.get("train", {}).get("camera_orientation_noise_std", 0.0)
             
@@ -102,41 +181,69 @@ class Trainer:
                 second_proj_angle[0] += np.random.normal(0, ori_noise_std)
                 second_proj_angle[1] += np.random.normal(0, ori_noise_std)
 
-        # First_projection
-        from_source_vec= (0,-dso[0],0)
-        from_rot_vec = (-1,0,0)
-        to_source_vec = axis_rotation((0,0,1), angle=first_proj_angle[0]/180*np.pi, vectors=from_source_vec)
-        to_rot_vec = axis_rotation((0,0,1), angle=first_proj_angle[0]/180*np.pi, vectors=from_rot_vec)
-        to_source_vec = axis_rotation(to_rot_vec[0], angle=first_proj_angle[1]/180*np.pi, vectors=to_source_vec[0])
+        if self.external_projection_case is not None:
+            source, detector, u_axis, v_axis = (
+                self.external_projection_case.camera_frames(self.external_view_indices)
+            )
+            projectors = []
+            for view_position in range(2):
+                source_to_detector = detector[view_position] - source[view_position]
+                source_to_detector /= np.linalg.norm(source_to_detector)
+                # ODL detector coordinates follow output array [row, column].
+                # Stage-2 rows increase along v and columns increase along u.
+                detector_axes = [v_axis[view_position], u_axis[view_position]]
+                projectors.append(ConeBeam3DProjector(
+                    image_size, image_reso, 0.0, u_axis[view_position],
+                    proj_size, proj_reso, dde[view_position], dso[view_position],
+                    src_to_det_init=source_to_detector,
+                    det_axes_init=detector_axes,
+                ))
+            self.ct_projector_first, self.ct_projector_second = projectors
+            selected_masks = self.external_projection_case.images[
+                self.external_view_indices
+            ]
+            data["projections"] = torch.tensor(
+                selected_masks[None, ...], dtype=torch.float32, device=device
+            )
+            train_projs_one = data["projections"][:, 0:1]
+            train_projs_two = data["projections"][:, 1:2]
+            print(f"Loaded external projections: {data['projections'].shape}")
+        else:
+            # First projection.
+            from_source_vec = (0, -dso[0], 0)
+            from_rot_vec = (-1, 0, 0)
+            to_source_vec = axis_rotation((0, 0, 1), angle=first_proj_angle[0] / 180 * np.pi, vectors=from_source_vec)
+            to_rot_vec = axis_rotation((0, 0, 1), angle=first_proj_angle[0] / 180 * np.pi, vectors=from_rot_vec)
+            to_source_vec = axis_rotation(to_rot_vec[0], angle=first_proj_angle[1] / 180 * np.pi, vectors=to_source_vec[0])
+            rot_mat = rotation_matrix_from_to(from_source_vec, to_source_vec[0])
+            proj_axis, proj_angle = rotation_matrix_to_axis_angle(rot_mat)
+            self.ct_projector_first = ConeBeam3DProjector(
+                image_size, image_reso, proj_angle, proj_axis, proj_size,
+                proj_reso, dde[0], dso[0]
+            )
 
-        rot_mat = rotation_matrix_from_to(from_source_vec, to_source_vec[0])
-        proj_axis, proj_angle = rotation_matrix_to_axis_angle(rot_mat)
+            # Second projection.
+            from_source_vec = (0, -dso[1], 0)
+            from_rot_vec = (-1, 0, 0)
+            to_source_vec = axis_rotation((0, 0, 1), angle=second_proj_angle[0] / 180 * np.pi, vectors=from_source_vec)
+            to_rot_vec = axis_rotation((0, 0, 1), angle=second_proj_angle[0] / 180 * np.pi, vectors=from_rot_vec)
+            to_source_vec = axis_rotation(to_rot_vec[0], angle=second_proj_angle[1] / 180 * np.pi, vectors=to_source_vec[0])
+            rot_mat = rotation_matrix_from_to(from_source_vec, to_source_vec[0])
+            proj_axis, proj_angle = rotation_matrix_to_axis_angle(rot_mat)
+            self.ct_projector_second = ConeBeam3DProjector(
+                image_size, image_reso, proj_angle, proj_axis, proj_size,
+                proj_reso, dde[1], dso[1]
+            )
 
-        self.ct_projector_first = ConeBeam3DProjector(image_size, image_reso, proj_angle, proj_axis, proj_size, proj_reso, dde[0], dso[0])
-
-        # Second_projection
-        from_source_vec= (0,-dso[1],0)
-        from_rot_vec = (-1,0,0)
-        to_source_vec = axis_rotation((0,0,1), angle=second_proj_angle[0]/180*np.pi, vectors=from_source_vec)
-        to_rot_vec = axis_rotation((0,0,1), angle=second_proj_angle[0]/180*np.pi, vectors=from_rot_vec)
-        to_source_vec = axis_rotation(to_rot_vec[0], angle=second_proj_angle[1]/180*np.pi, vectors=to_source_vec[0])
-
-        rot_mat = rotation_matrix_from_to(from_source_vec, to_source_vec[0])
-        proj_axis, proj_angle = rotation_matrix_to_axis_angle(rot_mat)
-
-        self.ct_projector_second = ConeBeam3DProjector(image_size, image_reso, proj_angle, proj_axis, proj_size, proj_reso, dde[1], dso[1])
-        
-        # Load 3D ground truth volume and generate projections (simplified)
-        phantom = np.load(gt_volume_path)
-        phantom = np.transpose(phantom, (1,2,0))[::,::-1,::-1]
-        phantom = np.transpose(phantom, (2,1,0))[::-1,::,::].copy()
-        phantom = torch.tensor(phantom, dtype=torch.float32)[None, ...]
-
-        train_projs_one = self.ct_projector_first.forward_project(phantom)
-        train_projs_two = self.ct_projector_second.forward_project(phantom)
-
-        data["projections"] = torch.cat((train_projs_one,train_projs_two), 1)
-        print(f"Generated projections from 3D volume: {data['projections'].shape}")
+            # Legacy/reproduction path: synthesize targets from a 3D GT volume.
+            phantom = np.load(gt_volume_path)
+            phantom = np.transpose(phantom, (1, 2, 0))[::, ::-1, ::-1]
+            phantom = np.transpose(phantom, (2, 1, 0))[::-1, ::, ::].copy()
+            phantom = torch.tensor(phantom, dtype=torch.float32, device=device)[None, ...]
+            train_projs_one = self.ct_projector_first.forward_project(phantom)
+            train_projs_two = self.ct_projector_second.forward_project(phantom)
+            data["projections"] = torch.cat((train_projs_one, train_projs_two), 1)
+            print(f"Generated projections from 3D volume: {data['projections'].shape}")
         
         # Dataset preparation based on mode
         self.use_sdf = cfg.get("train", {}).get("use_sdf", True)
@@ -191,6 +298,22 @@ class Trainer:
         self.best_loss = float('inf')
         self.best_epoch = 0
         self.best_model_state = None
+
+    def render_occupancy_projections(self, occupancy):
+        """Project a 3D occupancy field into the two configured detector views."""
+        projection_one = self.ct_projector_first.forward_project(occupancy)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        projection_two = self.ct_projector_second.forward_project(occupancy)
+        projections = torch.cat((projection_one, projection_two), dim=1)
+        if self.binary_projection_targets:
+            # External Stage-2 inputs are binary silhouettes, whereas ASTRA/ODL
+            # returns a non-negative line integral.  Convert that integral to a
+            # bounded, differentiable ray-occupancy probability.
+            projections = 1.0 - torch.exp(
+                -self.projection_attenuation * torch.clamp_min(projections, 0.0)
+            )
+        return projections
 
     def save_loss_plot(self):
         """
@@ -277,7 +400,9 @@ class Trainer:
             
             # Convert SDF to occupancy for projections
             from src.render.sdf_utils import sdf_to_occupancy
-            occupancy_for_proj = sdf_to_occupancy(pred_tensor, alpha=50.0)
+            occupancy_for_proj = sdf_to_occupancy(
+                pred_tensor, alpha=getattr(self, "sdf_alpha", 50.0)
+            )
             
             # Save converted occupancy
             occupancy_3d_filename = f"recon_occupancy_{self.current_model_id}.npy"
@@ -295,9 +420,98 @@ class Trainer:
             print(f"Saved 3D occupancy prediction: {occupancy_3d_path}")
             
             occupancy_for_proj = pred_tensor
+            occupancy_3d_data = model_pred
+
+        if self.external_projection_case is not None:
+            self._save_external_reconstruction_npz(model_pred, occupancy_3d_data)
         
         # Save all other comprehensive outputs (GT, projections, images, comparisons, network)
         self._save_comprehensive_outputs(pred_tensor, occupancy_for_proj, epoch)
+
+    def _save_external_reconstruction_npz(self, sdf_roi, occupancy_roi):
+        """Save ROI fields and a reference-grid binary volume in one NPZ."""
+        case = self.external_projection_case
+        threshold = float(
+            self.conf.get("exp", {}).get("output_occupancy_threshold", 0.5)
+        )
+        roi_mask = (np.asarray(occupancy_roi) >= threshold).astype(np.uint8)
+        roi_spacing_mm = np.asarray(self.dataconfig["dVoxel"], dtype=np.float32)
+        center_m = (
+            np.zeros(3, dtype=np.float32)
+            if case.projection_center_offset_m is None
+            else case.projection_center_offset_m.astype(np.float32)
+        )
+
+        payload = {
+            "sdf_roi_xyz": np.asarray(sdf_roi, dtype=np.float32),
+            "occupancy_roi_xyz": np.asarray(occupancy_roi, dtype=np.float32),
+            "roi_mask_xyz": roi_mask,
+            "roi_spacing_mm": roi_spacing_mm,
+            "roi_center_xyz_mm": center_m * 1000.0,
+            "roi_axis_order": np.asarray("XYZ"),
+            "view_indices": self.external_view_indices.astype(np.int32),
+            "theta_deg": case.theta_deg[self.external_view_indices],
+            "phi_deg": case.phi_deg[self.external_view_indices],
+            "clinical_views": case.clinical_views[self.external_view_indices],
+            "input_images": case.images[self.external_view_indices],
+            "projection_center_offset_m": center_m,
+            "sid_m": np.asarray(case.sid_m, dtype=np.float32),
+            "source_origin_distance_m": np.asarray(
+                case.source_origin_distance_m, dtype=np.float32
+            ),
+            "imager_pixel_spacing_mm": np.asarray(
+                case.detector_pixel_spacing_m * 1000.0, dtype=np.float32
+            ),
+            "occupancy_threshold": np.asarray(threshold, dtype=np.float32),
+            "source_projection_npz": np.asarray(str(case.path)),
+        }
+
+        if self.reference_volume_npz:
+            if case.projection_center_offset_m is None:
+                raise ValueError(
+                    "reference_volume_npz output mapping requires "
+                    "projection_center_offset in the projection NPZ."
+                )
+            with np.load(self.reference_volume_npz, allow_pickle=False) as reference:
+                if "vol" not in reference.files or "spacing" not in reference.files:
+                    raise KeyError(
+                        "reference_volume_npz must contain 'vol' and 'spacing'."
+                    )
+                reference_shape = np.asarray(reference["vol"].shape, dtype=np.int32)
+                reference_spacing = np.asarray(
+                    reference["spacing"], dtype=np.float32
+                ).reshape(3)
+                full_mask = embed_roi_mask_in_reference_grid(
+                    roi_mask,
+                    roi_spacing_mm=roi_spacing_mm,
+                    roi_center_xyz_mm=center_m * 1000.0,
+                    reference_shape_xyz=reference_shape,
+                    reference_spacing_xyz_mm=reference_spacing,
+                )
+                payload.update({
+                    "vol": full_mask,
+                    "spacing": reference_spacing,
+                    "vol_axis_order": np.asarray("XYZ"),
+                    "reference_shape_xyz": reference_shape,
+                    "source_reference_npz": np.asarray(
+                        str(osp.abspath(self.reference_volume_npz))
+                    ),
+                })
+                if "source_nii" in reference.files:
+                    payload["source_nii"] = np.asarray(reference["source_nii"])
+        else:
+            payload.update({
+                "vol": roi_mask,
+                "spacing": roi_spacing_mm,
+                "vol_axis_order": np.asarray("XYZ"),
+            })
+
+        output_path = osp.join(
+            self.output_recon_dir,
+            f"reconstruction_{self.current_model_id}.npz",
+        )
+        np.savez_compressed(output_path, **payload)
+        print(f"Saved combined NPZ reconstruction: {output_path}")
 
     def run_network_chunked(self, inputs, fn, chunk_size):
         """
@@ -364,15 +578,18 @@ class Trainer:
         
     def _save_comprehensive_outputs(self, sdf_pred_tensor, occupancy_pred, epoch):
         """Save comprehensive outputs including projections, images, and comparisons."""
-        # Save ground truth 3D model
-        gt_volume_filename = f"gt_volume_{self.current_model_id}.npy"
-        gt_volume_path = osp.join(self.output_recon_dir, gt_volume_filename)
-        input_data_dir = self.conf["exp"].get("input_data_dir", "./data/GT_volumes/")
-        original_model_id = str(self.current_model_id).split('_')[0]
-        original_gt_path = osp.join(input_data_dir, f"{original_model_id}.npy")
-        gt_volume = np.load(original_gt_path)
-        np.save(gt_volume_path, gt_volume)
-        print(f"Saved ground truth 3D model: {gt_volume_path}")
+        # The legacy path copies the synthetic source GT for reproduction.  In
+        # direct-NPZ mode, the reference voxel file is evaluation/output-grid
+        # metadata only and is never copied into the optimizer targets.
+        if self.external_projection_case is None:
+            gt_volume_filename = f"gt_volume_{self.current_model_id}.npy"
+            gt_volume_path = osp.join(self.output_recon_dir, gt_volume_filename)
+            input_data_dir = self.conf["exp"].get("input_data_dir", "./data/GT_volumes/")
+            original_model_id = str(self.current_model_id).split('_')[0]
+            original_gt_path = osp.join(input_data_dir, f"{original_model_id}.npy")
+            gt_volume = np.load(original_gt_path)
+            np.save(gt_volume_path, gt_volume)
+            print(f"Saved ground truth 3D model: {gt_volume_path}")
         
         # Save ground truth projections
         gt_projs_filename = f"gt_projections_{self.current_model_id}.npy"
@@ -382,9 +599,7 @@ class Trainer:
         print(f"Saved ground truth projections: {gt_projs_path}")
         
         # Generate predicted projections
-        pred_projs_one = self.ct_projector_first.forward_project(occupancy_pred)
-        pred_projs_two = self.ct_projector_second.forward_project(occupancy_pred)
-        pred_projs = torch.cat((pred_projs_one, pred_projs_two), 1)
+        pred_projs = self.render_occupancy_projections(occupancy_pred)
         
         pred_projs_filename = f"pred_projections_{self.current_model_id}.npy"
         pred_projs_path = osp.join(self.output_recon_dir, pred_projs_filename)
@@ -403,19 +618,18 @@ class Trainer:
         if self.sdf_loss_weight > 0:
             detector_pixel_size = self.dataconfig["dDetector"][0]
             
-            if self.use_sdf:
-                # SDF mode: convert 3D SDF to 2D SDF via occupancy
-                from src.render.sdf_utils import sdf_3d_to_occupancy_to_sdf_2d
-                pred_sdf_2d, _ = sdf_3d_to_occupancy_to_sdf_2d(
-                    sdf_pred_tensor, self.ct_projector_first, self.ct_projector_second,
-                    alpha=50.0, voxel_size_2d=detector_pixel_size
-                )
-            else:
-                # Occupancy mode: convert 2D occupancy projections to 2D SDF
-                from src.render.sdf_utils import occupancy_to_sdf_2d
-                sdf_2d_view1 = occupancy_to_sdf_2d(pred_projs[0, 0], voxel_size=detector_pixel_size, use_kornia=False)
-                sdf_2d_view2 = occupancy_to_sdf_2d(pred_projs[0, 1], voxel_size=detector_pixel_size, use_kornia=False)
-                pred_sdf_2d = torch.stack([sdf_2d_view1, sdf_2d_view2], dim=0)[None, ...]
+            from src.render.sdf_utils import occupancy_to_sdf_2d
+            sdf_2d_view1 = occupancy_to_sdf_2d(
+                pred_projs[0, 0], voxel_size=detector_pixel_size,
+                use_kornia=False
+            )
+            sdf_2d_view2 = occupancy_to_sdf_2d(
+                pred_projs[0, 1], voxel_size=detector_pixel_size,
+                use_kornia=False
+            )
+            pred_sdf_2d = torch.stack(
+                [sdf_2d_view1, sdf_2d_view2], dim=0
+            )[None, ...]
             
             pred_sdf_2d_filename = f"sdf_2d_pred_{self.current_model_id}.npy"
             pred_sdf_2d_path = osp.join(self.output_recon_dir, pred_sdf_2d_filename)
@@ -494,4 +708,3 @@ class Trainer:
         Training step
         """
         raise NotImplementedError()
-        

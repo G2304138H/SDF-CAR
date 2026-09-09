@@ -95,6 +95,35 @@ To train on a single model:
 python train.py --config config/CCTA.yaml
 ```
 
+### Direct per-scene optimization from segmented-view NPZ
+
+The original `CCTA.yaml` path loads a 3D volume and synthesizes its own
+projections. For the intended reconstruction setting, configure an external
+projection NPZ instead. The NPZ must contain `images [V,H,W]`, `theta_deg [V]`,
+`phi_deg [V]`, `sid`, and `imager_pixel_spacing`; the Stage-2 camera convention
+uses a 0.75 m source-to-isocentre distance.
+
+The supplied case is configured in `config/CCTA_npz_case1.yaml`:
+
+```bash
+python train.py --config config/CCTA_npz_case1.yaml
+```
+
+This selects views 0 and 1, performs a fresh patient-specific optimization,
+and does not load a pretrained checkpoint. `reference_volume_npz` is optional
+and is used only after optimization to map the centred reconstruction ROI back
+to the reference XYZ grid. It is never used to form the optimization targets.
+
+The combined output is saved as
+`reconstruction_<current_model_id>.npz`. It contains the raw XYZ SDF ROI, the
+soft occupancy ROI, the thresholded ROI mask, camera/input metadata, and `vol`.
+When a reference NPZ with `vol` and `spacing` is configured, output `vol` has
+that reference shape and is a binary `uint8` XYZ voxel array.
+
+Direct optimization still requires an NVIDIA CUDA system: the hash-grid
+encoder compiles a CUDA extension and the forward projector uses
+`astra_cuda`. It cannot run on CPU-only or Apple Silicon environments.
+
 ### Batch Training
 To train on multiple models automatically:
 

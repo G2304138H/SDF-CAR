@@ -1,0 +1,50 @@
+exp:
+  dataconfig: ./config/config.yml
+  projection_npz: /Users/renyu/Downloads/2d_1.npz
+  reference_volume_npz: /Users/renyu/Downloads/voxel_1.npz
+  output_recon_dir: ./logs/reconstructions_npz/
+  current_model_id: rca_0001_views_0_1
+  view_indices: [0, 1]
+  # Fixed by the Stage-2 projection generator; SID is read from the NPZ.
+  source_origin_distance_m: 0.75
+  reconstruction_nVoxel: [128, 128, 128]
+  # null derives the 117.33 mm isocentre FOV from detector width, SID and DSO.
+  reconstruction_extent_m: null
+  output_occupancy_threshold: 0.5
+
+network:
+  net_type: mlp
+  num_layers: 8
+  hidden_dim: 256
+  skips: [4]
+  out_dim: 1
+  bound: 0.3
+  use_gradient_checkpointing: true
+
+encoder:
+  encoding: hashgrid
+  input_dim: 3
+  num_levels: 16
+  level_dim: 2
+  base_resolution: 16
+  log2_hashmap_size: 19
+
+render:
+  netchunk: 699060
+
+train:
+  epoch: 5000
+  lrate: 0.0001
+  mixed_precision: true
+  weight_decay: 0.000001
+  memory_efficient_eval: true
+  use_sdf: true
+  sdf_alpha: 50.0
+  # Convert non-negative ray length (mm) to a differentiable [0,1] silhouette.
+  projection_attenuation: 1.0
+  # Internal order is [occupancy projection, 2D geometric SDF].  This maps the
+  # paper's lambda_occ=0.25 and lambda_geo=1.0 to the implementation.
+  current_loss_weights: [0.25, 1.0]
+  camera_noise_enabled: false
+  camera_position_noise_std: 0.0
+  camera_orientation_noise_std: 0.0

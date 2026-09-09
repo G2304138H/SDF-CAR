@@ -47,27 +47,18 @@ def occupancy_to_sdf_2d(occupancy_2d, voxel_size=1.0, use_kornia=True):
     
     # Use differentiable kornia implementation if available and requested
     if KORNIA_AVAILABLE and use_kornia:
-        # Threshold to create binary mask
-        binary_mask = (occupancy_2d > 0.5).float()  # [B, H, W]
-        
-        # kornia expects [B, C, H, W], add channel dimension
-        binary_mask = binary_mask.unsqueeze(1)  # [B, 1, H, W]
-        
-        # Distance transform for inside (negative distances)
-        # For inside: distance to nearest 0 (background) from foreground points
-        inside_dist = distance_transform(binary_mask) * voxel_size  # [B, 1, H, W]
-        
-        # Distance transform for outside (positive distances)
-        # For outside: distance to nearest 1 (foreground) from background points
-        outside_dist = distance_transform(1.0 - binary_mask) * voxel_size  # [B, 1, H, W]
-        
-        # Remove channel dimension
-        inside_dist = inside_dist.squeeze(1)  # [B, H, W]
-        outside_dist = outside_dist.squeeze(1)  # [B, H, W]
-        binary_mask = binary_mask.squeeze(1)  # [B, H, W]
-        
-        # Combine: negative inside, positive outside
-        sdf_2d = torch.where(binary_mask > 0.5, -inside_dist, outside_dist)
+        # Kornia defines DT(image) as distance to the nearest non-zero pixel.
+        # Keeping this mask soft preserves the gradient from the geometric loss
+        # back to the projected volume.  A hard ``> 0.5`` conversion here would
+        # sever that gradient entirely.
+        soft_mask = occupancy_2d.clamp(0.0, 1.0).unsqueeze(1)
+
+        # Positive outside and negative inside.  For a binary input,
+        # DT(mask) is zero inside and positive outside; DT(1-mask) is the
+        # converse.
+        distance_to_foreground = distance_transform(soft_mask) * voxel_size
+        distance_to_background = distance_transform(1.0 - soft_mask) * voxel_size
+        sdf_2d = (distance_to_foreground - distance_to_background).squeeze(1)
         
         # Remove batch dimension if input was 2D
         if len(original_shape) == 2:
