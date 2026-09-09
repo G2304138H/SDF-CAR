@@ -1,7 +1,7 @@
 exp:
   dataconfig: ./config/config.yml
-  projection_npz: /Users/renyu/Downloads/2d_1.npz
-  reference_volume_npz: /Users/renyu/Downloads/voxel_1.npz
+  projection_npz: /export/home2/reny0012/code/SDF-CAR/data/2d_1.npz
+  reference_volume_npz: /export/home2/reny0012/code/SDF-CAR/data/voxel_1.npz
   output_recon_dir: ./logs/reconstructions_npz/
   current_model_id: rca_0001_views_0_1
   view_indices: [0, 1]
