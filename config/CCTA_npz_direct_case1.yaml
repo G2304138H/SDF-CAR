@@ -6,7 +6,7 @@ exp:
   # Optional: used only after optimization for full-grid output and GT DSC.
   reference_volume_npz: /export/home2/reny0012/code/SDF-CAR/data/voxel_1.npz
   output_recon_dir: ./logs/reconstructions_npz/
-  current_model_id: rca_0001_input_views_0_1
+  current_model_id: rca_0001_input_views_0_1_check_gradient
   view_indices: [0, 1]
   source_origin_distance_m: 0.75
   reconstruction_nVoxel: [128, 128, 128]
