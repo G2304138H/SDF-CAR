@@ -1,9 +1,12 @@
 import os
+import json
 import math
+import time
 import yaml
 import torch
 import numpy as np
 import os.path as osp
+from datetime import datetime, timezone
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 
@@ -32,6 +35,8 @@ def rotation_matrix_to_axis_angle(m):
 
 class Trainer:
     def __init__(self, cfg, device="cuda"):
+        initialization_started = time.perf_counter()
+        self.case_started_at_utc = datetime.now(timezone.utc).isoformat()
 
         # Args
         self.conf = cfg
@@ -299,6 +304,17 @@ class Trainer:
         self.best_epoch = 0
         self.best_model_state = None
 
+        self._synchronize_cuda_for_timing()
+        self.initialization_time_seconds = (
+            time.perf_counter() - initialization_started
+        )
+
+    @staticmethod
+    def _synchronize_cuda_for_timing():
+        """Wait for queued GPU work before reading a wall-clock boundary."""
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
     def render_occupancy_projections(self, occupancy):
         """Project a 3D occupancy field into the two configured detector views."""
         projection_one = self.ct_projector_first.forward_project(occupancy)
@@ -339,6 +355,12 @@ class Trainer:
         """
         Main loop with memory optimizations.
         """
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+        self._synchronize_cuda_for_timing()
+        run_started = time.perf_counter()
+        optimization_started = time.perf_counter()
+
         for idx_epoch in tqdm(range(1, self.epochs+1)):
             
             # Clear cache before evaluation
@@ -356,6 +378,21 @@ class Trainer:
             self.training_losses.append(current_loss)
             
             print(f"epoch={idx_epoch}/{self.epochs}, loss={current_loss:.6f}")
+
+        self._synchronize_cuda_for_timing()
+        self.optimization_time_seconds = (
+            time.perf_counter() - optimization_started
+        )
+        self.mean_epoch_time_seconds = (
+            self.optimization_time_seconds / self.epochs
+            if self.epochs > 0 else 0.0
+        )
+        print(
+            "Optimization time: "
+            f"{self.optimization_time_seconds:.3f} s "
+            f"({self.optimization_time_seconds / 60.0:.3f} min), "
+            f"mean {self.mean_epoch_time_seconds:.4f} s/epoch"
+        )
             
         # Save loss plot after training completion
         self.save_loss_plot()
@@ -364,6 +401,8 @@ class Trainer:
         print(f"\nEvaluating last model from epoch {self.epochs}")
         
         # Evaluate last model (current state)
+        self._synchronize_cuda_for_timing()
+        evaluation_started = time.perf_counter()
         self.net.eval()
         with torch.no_grad():
             if self.memory_efficient_eval:
@@ -377,11 +416,65 @@ class Trainer:
                 model_pred = run_network(self.voxels, self.net, self.netchunk)
             
             model_pred = (model_pred.squeeze()).detach().cpu().numpy()
+
+            self._synchronize_cuda_for_timing()
+            self.final_evaluation_time_seconds = (
+                time.perf_counter() - evaluation_started
+            )
+            self.total_compute_time_seconds = (
+                self.initialization_time_seconds
+                + self.optimization_time_seconds
+                + self.final_evaluation_time_seconds
+            )
             
             # Save last model results with all the comprehensive outputs
             self._save_best_model_results(model_pred, self.epochs)
+
+        self._synchronize_cuda_for_timing()
+        self.end_to_end_time_seconds = (
+            self.initialization_time_seconds
+            + time.perf_counter() - run_started
+        )
+        self.case_completed_at_utc = datetime.now(timezone.utc).isoformat()
+        self._save_case_timing()
         
         tqdm.write(f"Training complete! Saved last model from epoch {self.epochs}")
+
+    def _save_case_timing(self):
+        """Write human-readable timing and environment metadata for this case."""
+        timing = {
+            "case_id": str(self.current_model_id),
+            "status": "completed",
+            "epochs": int(self.epochs),
+            "started_at_utc": self.case_started_at_utc,
+            "completed_at_utc": self.case_completed_at_utc,
+            "initialization_time_seconds": self.initialization_time_seconds,
+            "optimization_time_seconds": self.optimization_time_seconds,
+            "optimization_time_minutes": self.optimization_time_seconds / 60.0,
+            "mean_epoch_time_seconds": self.mean_epoch_time_seconds,
+            "final_evaluation_time_seconds": self.final_evaluation_time_seconds,
+            "total_compute_time_seconds": self.total_compute_time_seconds,
+            "end_to_end_time_seconds": self.end_to_end_time_seconds,
+            "pytorch_version": torch.__version__,
+            "pytorch_cuda_version": torch.version.cuda,
+            "cuda_available": torch.cuda.is_available(),
+        }
+        if torch.cuda.is_available():
+            timing.update({
+                "cuda_device": torch.cuda.get_device_name(),
+                "peak_gpu_memory_gb": (
+                    torch.cuda.max_memory_allocated() / 1024 ** 3
+                ),
+            })
+
+        timing_path = osp.join(
+            self.output_recon_dir,
+            f"timing_{self.current_model_id}.json",
+        )
+        with open(timing_path, "w", encoding="utf-8") as handle:
+            json.dump(timing, handle, indent=2)
+            handle.write("\n")
+        print(f"Saved case timing: {timing_path}")
         
     def _save_best_model_results(self, model_pred, epoch):
         """Save comprehensive results for the best model."""
@@ -463,6 +556,21 @@ class Trainer:
                 case.detector_pixel_spacing_m * 1000.0, dtype=np.float32
             ),
             "occupancy_threshold": np.asarray(threshold, dtype=np.float32),
+            "initialization_time_seconds": np.asarray(
+                self.initialization_time_seconds, dtype=np.float64
+            ),
+            "optimization_time_seconds": np.asarray(
+                self.optimization_time_seconds, dtype=np.float64
+            ),
+            "mean_epoch_time_seconds": np.asarray(
+                self.mean_epoch_time_seconds, dtype=np.float64
+            ),
+            "final_evaluation_time_seconds": np.asarray(
+                self.final_evaluation_time_seconds, dtype=np.float64
+            ),
+            "total_compute_time_seconds": np.asarray(
+                self.total_compute_time_seconds, dtype=np.float64
+            ),
             "source_projection_npz": np.asarray(str(case.path)),
         }
 

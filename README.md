@@ -120,6 +120,12 @@ soft occupancy ROI, the thresholded ROI mask, camera/input metadata, and `vol`.
 When a reference NPZ with `vol` and `spacing` is configured, output `vol` has
 that reference shape and is a binary `uint8` XYZ voxel array.
 
+Per-case timing is recorded with CUDA synchronization at each measurement
+boundary. `optimization_time_seconds`, `mean_epoch_time_seconds`, initialization,
+evaluation, and total compute time are embedded in the reconstruction NPZ. A
+human-readable `timing_<current_model_id>.json` is saved beside it and also
+reports end-to-end wall time, GPU model, and peak allocated GPU memory.
+
 Direct optimization still requires an NVIDIA CUDA system: the hash-grid
 encoder compiles a CUDA extension and the forward projector uses
 `astra_cuda`. It cannot run on CPU-only or Apple Silicon environments.
