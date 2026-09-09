@@ -28,6 +28,10 @@ train:
   epoch: 5000
   lrate: [0.0001]  # List of learning rates to experiment with
   mixed_precision: true  # Enable mixed precision training
+  # If AMP is retained for a legacy experiment, do not begin by multiplying
+  # the custom ODL/ASTRA backward signal by GradScaler's usual 65536 factor.
+  amp_initial_scale: 1.0
+  gradient_probe_epochs: 1
   weight_decay: 0.000001  # Add weight decay for regularization (1e-6)
   memory_efficient_eval: true  # Use memory-efficient evaluation
   # SDF-related parameters

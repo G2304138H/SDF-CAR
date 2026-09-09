@@ -201,6 +201,15 @@ silhouette, then reaches its configured weight over
 `train.sdf_loss_ramp_epochs` (default 400). The effective weight is printed and
 written to the JSONL log each epoch. A non-finite epoch never updates AdamW.
 
+The NPZ configurations disable mixed precision by default. Although the
+projection forward pass can be finite under AMP, loss scaling also scales the
+signal entering ODL's custom ASTRA adjoint and can yield a non-finite backward
+pass. The first epoch retains gradient probes at each rendering boundary and
+records them as `*_gradient_finite`, `*_gradient_norm`, `*_gradient_min`, and
+`*_gradient_max` fields. The target pip environment pins `odl==0.8.3` and
+`astra-toolbox==2.4.1`; verify that `astra.use_cuda()` returns `True` before
+training.
+
 During output evaluation, `reference_volume_npz` maps the centred reconstruction
 ROI back to the reference XYZ grid and supplies the GT mask for DSC.
 

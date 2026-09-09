@@ -54,7 +54,11 @@ visualization:
 train:
   epoch: 5000
   lrate: 0.0001
-  mixed_precision: true
+  # ODL uses a custom ASTRA adjoint. Keep this path in FP32 because scaled AMP
+  # gradients can become non-finite even when the forward loss is finite.
+  mixed_precision: false
+  amp_initial_scale: 1.0
+  gradient_probe_epochs: 1
   weight_decay: 0.000001
   memory_efficient_eval: true
   use_sdf: true

@@ -1,5 +1,20 @@
 # Change log
 
+## 2026-09-09 — ODL backward non-finite-gradient fix
+
+- Default both NPZ reconstruction configurations to full FP32. Their finite
+  first projection loss followed by NaN parameter gradients localized the
+  failure to backward propagation through ODL's custom ASTRA adjoint and the
+  mixed-precision network, not to the camera geometry or Kornia loss.
+- Set AMP's initial loss scale to `1.0` for legacy configurations that retain
+  mixed precision, instead of applying the default large scale to the custom
+  projector backward pass.
+- During the configured first diagnostic epoch, retain and log gradients at
+  the projected probability, raw ray integral, occupancy volume, and network
+  output. This precisely identifies the first operation producing a NaN.
+- Pin the pip-only environment to ODL 0.8.3 and CUDA-enabled ASTRA Toolbox
+  2.4.1; ASTRA 2.5.0 reported `use_cuda() == False` on the target server.
+
 ## 2026-09-09 — First-epoch non-finite-gradient fix
 
 - Bound Kornia soft distance-transform inputs to `[1e-6, 1 - 1e-6]`.

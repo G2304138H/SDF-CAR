@@ -171,6 +171,18 @@ class BasicTrainer(Trainer):
         loss["projection_min"] = train_projs.detach().amin()
         loss["projection_max"] = train_projs.detach().amax()
 
+        if self.current_epoch <= self.gradient_probe_epochs:
+            gradient_probes = {
+                "projected_probability": train_projs,
+                "raw_ray_integral": raw_train_projs,
+                "occupancy_volume": train_output_occupancy,
+                "network_output": train_output,
+            }
+            for tensor in gradient_probes.values():
+                if tensor.requires_grad:
+                    tensor.retain_grad()
+            loss["_gradient_probes"] = gradient_probes
+
         return loss
 
 if __name__ == "__main__":

@@ -1,10 +1,10 @@
-astra-toolbox
+astra-toolbox==2.4.1
 imageio
 kornia
 matplotlib
 ninja
 numpy
-odl
+odl==0.8.3
 pandas
 pillow
 pyyaml

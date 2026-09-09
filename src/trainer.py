@@ -50,9 +50,23 @@ class Trainer:
         # Memory optimization settings
         self.use_mixed_precision = cfg.get("train", {}).get("mixed_precision", True)
         self.memory_efficient_eval = cfg.get("train", {}).get("memory_efficient_eval", True)
+        self.amp_initial_scale = float(
+            cfg.get("train", {}).get("amp_initial_scale", 1.0)
+        )
+        self.gradient_probe_epochs = int(
+            cfg.get("train", {}).get("gradient_probe_epochs", 1)
+        )
+        if not math.isfinite(self.amp_initial_scale) or self.amp_initial_scale <= 0.0:
+            raise ValueError("train.amp_initial_scale must be finite and positive.")
+        if self.gradient_probe_epochs < 0:
+            raise ValueError("train.gradient_probe_epochs must be non-negative.")
         
         # Initialize AMP scaler for mixed precision training
-        self.scaler = torch.amp.GradScaler('cuda', enabled=self.use_mixed_precision)
+        self.scaler = torch.amp.GradScaler(
+            'cuda',
+            enabled=self.use_mixed_precision,
+            init_scale=self.amp_initial_scale,
+        )
         
         # Setup output directories for batch processing
         base_output_dir = cfg["exp"].get("output_recon_dir", "./logs/reconstructions/")
@@ -122,6 +136,8 @@ class Trainer:
             "ODL projection and binary ray-to-mask exponential run in FP32",
             "Kornia distance-transform inputs are epsilon-bounded to prevent log(0) NaN gradients",
             "projection-only warm-up and an SDF-weight ramp isolate and stabilize the two loss paths",
+            "direct-NPZ configurations use FP32 to keep AMP scaling out of ODL's custom adjoint",
+            "first-epoch gradient probes localize failures across projection, ODL adjoint, occupancy, and network output",
             "2D SDF training loss fails fast unless differentiable Kornia is installed",
             "loss components, tensor ranges, gradient norm, AMP skips, and parameter updates are logged",
             "non-finite loss or gradients skip the optimizer step so parameters are not corrupted",
@@ -442,6 +458,8 @@ class Trainer:
             "sdf_loss_warmup_epochs": self.sdf_loss_warmup_epochs,
             "sdf_loss_ramp_epochs": self.sdf_loss_ramp_epochs,
             "mixed_precision_network": bool(self.use_mixed_precision),
+            "amp_initial_scale": self.amp_initial_scale,
+            "gradient_probe_epochs": self.gradient_probe_epochs,
             "sdf_initial_bias": float(
                 self.conf.get("network", {}).get("sdf_initial_bias", 0.1)
             ),
@@ -531,6 +549,11 @@ class Trainer:
                 f"{loss_train['raw_projection_max']:.3e}], "
                 f"pred=[{loss_train['projection_min']:.3e},"
                 f"{loss_train['projection_max']:.3e}], "
+                "grad_path="
+                f"projection:{loss_train.get('projected_probability_gradient_finite')}/"
+                f"raw:{loss_train.get('raw_ray_integral_gradient_finite')}/"
+                f"occupancy:{loss_train.get('occupancy_volume_gradient_finite')}/"
+                f"network:{loss_train.get('network_output_gradient_finite')}, "
                 f"amp_step_skipped={loss_train['amp_step_skipped']}"
             )
             if (
@@ -1023,6 +1046,37 @@ class Trainer:
             # model.
             self.scaler.scale(loss["loss"]).backward()
             self.scaler.unscale_(self.optimizer)
+
+            for name, tensor in loss.get("_gradient_probes", {}).items():
+                gradient = tensor.grad
+                prefix = f"{name}_gradient"
+                diagnostics[f"{prefix}_present"] = gradient is not None
+                if gradient is None:
+                    diagnostics[f"{prefix}_finite"] = False
+                    diagnostics[f"{prefix}_norm"] = None
+                    diagnostics[f"{prefix}_min"] = None
+                    diagnostics[f"{prefix}_max"] = None
+                    continue
+                gradient_fp32 = gradient.detach().float()
+                gradient_finite = bool(
+                    torch.isfinite(gradient_fp32).all().item()
+                )
+                diagnostics[f"{prefix}_finite"] = gradient_finite
+                if gradient_finite:
+                    diagnostics[f"{prefix}_norm"] = float(
+                        torch.linalg.vector_norm(gradient_fp32).item()
+                    )
+                    diagnostics[f"{prefix}_min"] = float(
+                        gradient_fp32.amin().item()
+                    )
+                    diagnostics[f"{prefix}_max"] = float(
+                        gradient_fp32.amax().item()
+                    )
+                else:
+                    diagnostics[f"{prefix}_norm"] = None
+                    diagnostics[f"{prefix}_min"] = None
+                    diagnostics[f"{prefix}_max"] = None
+
             for parameter in self.grad_vars:
                 if parameter.grad is None:
                     continue
