@@ -79,12 +79,21 @@ class Trainer:
         self.reference_volume_npz = cfg["exp"].get("reference_volume_npz")
         self.visualization_outputs = []
         self.visualization_errors = []
-        self.binary_projection_targets = bool(projection_npz)
+        self.binary_projection_targets = False
         self.projection_attenuation = float(
             cfg.get("train", {}).get("projection_attenuation", 1.0)
         )
 
         if projection_npz:
+            if (
+                cfg.get("projection_generation")
+                and not osp.exists(osp.expanduser(str(projection_npz)))
+            ):
+                raise FileNotFoundError(
+                    f"Generated projection NPZ not found: {projection_npz}. "
+                    "Run `python generate_2d_projections.py --config "
+                    "<the-same-case-yaml>` before train.py."
+                )
             source_origin_distance_m = float(
                 cfg["exp"].get("source_origin_distance_m", 0.75)
             )
@@ -92,6 +101,7 @@ class Trainer:
                 projection_npz,
                 source_origin_distance_m=source_origin_distance_m,
             )
+            self.binary_projection_targets = case.is_binary_mask
             view_indices = validate_view_indices(
                 cfg["exp"].get("view_indices", [0, 1]), case.num_views
             )
@@ -136,6 +146,10 @@ class Trainer:
             self.external_projection_case = case
             self.external_view_indices = view_indices
             print(f"External projection NPZ: {case.path}")
+            print(
+                "Projection representation: "
+                f"{case.projection_representation}"
+            )
             print(f"Selected views: {view_indices.tolist()}")
             for index in view_indices:
                 print(

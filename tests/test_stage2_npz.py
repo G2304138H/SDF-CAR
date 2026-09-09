@@ -7,6 +7,7 @@ import numpy as np
 from src.dataset.stage2_npz import (
     binary_mask_dice,
     embed_roi_mask_in_reference_grid,
+    extract_reference_grid_roi,
     load_stage2_projection_case,
     stage2_angles_to_camera_frames,
 )
@@ -34,7 +35,25 @@ class Stage2NpzTest(unittest.TestCase):
         self.assertEqual(case.detector_shape, (8, 8))
         self.assertAlmostEqual(case.detector_origin_distance_m, 0.15, places=6)
         self.assertAlmostEqual(case.detector_pixel_spacing_m, 0.00055, places=8)
+        self.assertEqual(case.projection_representation, "binary_mask")
         self.assertEqual(case.cone_vectors().shape, (2, 12))
+
+    def test_loads_explicit_line_integral_representation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "line_integrals.npz"
+            np.savez_compressed(
+                path,
+                images=np.full((2, 8, 8), 2.5, dtype=np.float32),
+                theta_deg=np.asarray([0.0, 90.0], dtype=np.float32),
+                phi_deg=np.asarray([0.0, 0.0], dtype=np.float32),
+                sid=np.asarray(0.9, dtype=np.float32),
+                imager_pixel_spacing=np.asarray(0.55, dtype=np.float32),
+                projection_representation=np.asarray("line_integral_mm"),
+            )
+            case = load_stage2_projection_case(path)
+
+        self.assertFalse(case.is_binary_mask)
+        self.assertEqual(case.projection_representation, "line_integral_mm")
 
     def test_zero_angles_match_stage2_base_camera(self):
         source, detector, u_axis, v_axis = stage2_angles_to_camera_frames(
@@ -73,6 +92,17 @@ class Stage2NpzTest(unittest.TestCase):
             np.zeros((2, 2), dtype=np.uint8),
         )
         self.assertEqual(empty_dice, 1.0)
+
+    def test_extracts_reference_roi_at_physical_center(self):
+        reference = np.arange(5 ** 3, dtype=np.int32).reshape(5, 5, 5)
+        roi = extract_reference_grid_roi(
+            reference,
+            reference_spacing_xyz_mm=(1.0, 1.0, 1.0),
+            roi_shape_xyz=(3, 3, 3),
+            roi_spacing_xyz_mm=(1.0, 1.0, 1.0),
+            roi_center_xyz_mm=(2.0, 2.0, 2.0),
+        )
+        np.testing.assert_array_equal(roi, reference[1:4, 1:4, 1:4])
 
 
 if __name__ == "__main__":
