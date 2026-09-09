@@ -56,7 +56,7 @@ conda activate sdf-car
 conda install pytorch torchvision torchaudio pytorch-cuda=11.8 -c pytorch -c nvidia
 
 # 4. Install required dependencies
-pip install numpy scipy pyyaml tqdm matplotlib pandas
+pip install numpy scipy pyyaml tqdm matplotlib pandas scikit-image imageio pillow kornia
 pip install odl tigre
 
 # 5. (Optional) Install tiny-cuda-nn for hash encoding acceleration
@@ -103,16 +103,36 @@ projection NPZ instead. The NPZ must contain `images [V,H,W]`, `theta_deg [V]`,
 `phi_deg [V]`, `sid`, and `imager_pixel_spacing`; the Stage-2 camera convention
 uses a 0.75 m source-to-isocentre distance.
 
-The supplied case is configured in `config/CCTA_npz_case1.yaml`:
+The supplied case is configured in `config/CCTA_npz_case1.yaml`. It supports a
+two-stage, same-YAML geometry-validation workflow. First generate training
+views from the reference voxel mask with the exact ODL/ASTRA cameras, then run
+optimization from the generated NPZ:
 
 ```bash
+python generate_2d_projections.py --config config/CCTA_npz_case1.yaml
 python train.py --config config/CCTA_npz_case1.yaml
 ```
 
-This selects views 0 and 1, performs a fresh patient-specific optimization,
-and does not load a pretrained checkpoint. `reference_volume_npz` is optional
-and is used only after optimization to map the centred reconstruction ROI back
-to the reference XYZ grid. It is never used to form the optimization targets.
+`projection_generation.camera_metadata_npz` supplies the camera angles, SID,
+detector spacing, clinical labels, and projection centre. The generator ignores
+that file's existing images. It samples `reference_volume_npz["vol"]` into the
+configured centred reconstruction grid, forward-projects it with
+`ODL ConeBeamGeometry`/`astra_cuda`, and writes `exp.projection_npz` plus PNGs
+for the two selected views. The NPZ uses the raw ray lengths as its training
+`images`, matching the original SDF-CAR synthetic-projection path; it also keeps
+binary silhouettes under `binary_images` for inspection. The original
+camera-metadata NPZ is not overwritten.
+Training reads the generated `exp.projection_npz` from the same YAML, selects
+views 0 and 1, performs a fresh patient-specific optimization, and does not load
+a pretrained checkpoint.
+
+This generated-view mode is a controlled geometry/optimization validation: it
+uses the reference 3D mask to create the 2D targets, so it must not be reported
+as real two-view inference. For real inference, point `exp.projection_npz`
+directly at the acquired/segmented view NPZ and do not run the generator.
+
+During output evaluation, `reference_volume_npz` maps the centred reconstruction
+ROI back to the reference XYZ grid and supplies the GT mask for DSC.
 
 The combined output is saved as
 `reconstruction_<current_model_id>.npz`. It contains the raw XYZ SDF ROI, the
@@ -131,6 +151,14 @@ compared with `reference_volume_npz["vol"] > 0`. The voxel mask Dice score
 `2 * intersection / (prediction + reference)` is printed and saved as
 `mask_dsc` in both the reconstruction NPZ and timing JSON. Foreground and
 intersection voxel counts are saved alongside it for verification.
+
+Visual quality-control artifacts are also generated after direct optimization:
+`predicted_projection_view_<index>.png` for each selected input camera, plus
+`3d_ground_truth_surface.gif` and `3d_prediction_surface.gif` when a reference
+volume is available. The two surface GIFs match the parametric evaluator's
+single-surface camera path (24 frames, 5 FPS, one 360-degree azimuth rotation,
+with sinusoidal elevation from 16 to 28 degrees). These settings can be changed
+under `visualization` in the case YAML.
 
 Direct optimization still requires an NVIDIA CUDA system: the hash-grid
 encoder compiles a CUDA extension and the forward projector uses

@@ -32,6 +32,7 @@ class Stage2ProjectionCase:
     detector_pixel_spacing_m: float
     clinical_views: np.ndarray
     projection_center_offset_m: Optional[np.ndarray]
+    projection_representation: str
 
     @property
     def num_views(self) -> int:
@@ -43,7 +44,7 @@ class Stage2ProjectionCase:
 
     @property
     def is_binary_mask(self) -> bool:
-        return bool(np.all(np.logical_or(self.images == 0.0, self.images == 1.0)))
+        return self.projection_representation == "binary_mask"
 
     @property
     def isocenter_fov_m(self) -> float:
@@ -188,6 +189,21 @@ def load_stage2_projection_case(
         )
         if center_offset is not None and not np.isfinite(center_offset).all():
             raise ValueError("projection_center_offset contains NaN or infinity.")
+        if "projection_representation" in data.files:
+            projection_representation = str(
+                _scalar(data, "projection_representation")
+            ).strip().lower()
+        else:
+            projection_representation = (
+                "binary_mask"
+                if float(images.min()) >= 0.0 and float(images.max()) <= 1.0
+                else "line_integral_mm"
+            )
+        if projection_representation not in {"binary_mask", "line_integral_mm"}:
+            raise ValueError(
+                "projection_representation must be 'binary_mask' or "
+                f"'line_integral_mm', got {projection_representation!r}."
+            )
 
     return Stage2ProjectionCase(
         path=npz_path,
@@ -201,6 +217,7 @@ def load_stage2_projection_case(
         detector_pixel_spacing_m=detector_pixel_spacing_m,
         clinical_views=clinical_views,
         projection_center_offset_m=center_offset,
+        projection_representation=projection_representation,
     )
 
 
@@ -326,6 +343,65 @@ def embed_roi_mask_in_reference_grid(
     return output
 
 
+def extract_reference_grid_roi(
+    reference_volume_xyz: np.ndarray,
+    *,
+    reference_spacing_xyz_mm: Sequence[float],
+    roi_shape_xyz: Sequence[int],
+    roi_spacing_xyz_mm: Sequence[float],
+    roi_center_xyz_mm: Sequence[float],
+) -> np.ndarray:
+    """Nearest-neighbour sample a centred XYZ ROI from a reference grid.
+
+    This is the inverse coordinate convention of
+    :func:`embed_roi_mask_in_reference_grid`: reference index ``[0,0,0]`` is
+    physical XYZ ``[0,0,0]`` millimetres, while the returned ROI is centred on
+    ``roi_center_xyz_mm`` and follows the voxel-centre coordinates used by the
+    SDF-CAR reconstruction grid.
+    """
+    reference = np.asarray(reference_volume_xyz)
+    if reference.ndim != 3:
+        raise ValueError(
+            f"reference_volume_xyz must be 3D, got {reference.shape}."
+        )
+    reference_spacing = np.asarray(
+        reference_spacing_xyz_mm, dtype=np.float64
+    ).reshape(3)
+    roi_shape = np.asarray(roi_shape_xyz, dtype=np.int64).reshape(3)
+    roi_spacing = np.asarray(roi_spacing_xyz_mm, dtype=np.float64).reshape(3)
+    roi_center = np.asarray(roi_center_xyz_mm, dtype=np.float64).reshape(3)
+    if np.any(reference_spacing <= 0.0) or np.any(roi_spacing <= 0.0):
+        raise ValueError("Voxel spacing must be positive.")
+    if np.any(roi_shape <= 0):
+        raise ValueError("ROI shape must be positive.")
+    if not np.isfinite(roi_center).all():
+        raise ValueError("ROI centre contains NaN or infinity.")
+
+    roi_first_center = roi_center - (roi_shape - 1) * roi_spacing / 2.0
+    physical_axes = [
+        first + np.arange(int(size), dtype=np.float64) * spacing
+        for first, size, spacing in zip(roi_first_center, roi_shape, roi_spacing)
+    ]
+    reference_indices = [
+        np.rint(axis / spacing).astype(np.int64)
+        for axis, spacing in zip(physical_axes, reference_spacing)
+    ]
+    valid = [
+        np.logical_and(index >= 0, index < int(size))
+        for index, size in zip(reference_indices, reference.shape)
+    ]
+    output = np.zeros(tuple(int(value) for value in roi_shape), dtype=reference.dtype)
+    if not all(np.any(axis_valid) for axis_valid in valid):
+        return output
+
+    roi_selection = np.ix_(*[np.flatnonzero(axis_valid) for axis_valid in valid])
+    reference_selection = np.ix_(*[
+        index[axis_valid] for index, axis_valid in zip(reference_indices, valid)
+    ])
+    output[roi_selection] = reference[reference_selection]
+    return output
+
+
 def binary_mask_dice(
     prediction_mask: np.ndarray,
     reference_mask: np.ndarray,
@@ -360,6 +436,7 @@ __all__ = [
     "Stage2ProjectionCase",
     "binary_mask_dice",
     "embed_roi_mask_in_reference_grid",
+    "extract_reference_grid_roi",
     "load_stage2_projection_case",
     "stage2_angles_to_camera_frames",
     "validate_view_indices",

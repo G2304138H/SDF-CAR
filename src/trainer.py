@@ -8,6 +8,9 @@ import numpy as np
 import os.path as osp
 from datetime import datetime, timezone
 from tqdm import tqdm
+import matplotlib
+
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from .network import get_network
@@ -74,12 +77,23 @@ class Trainer:
         self.external_projection_case = None
         self.external_view_indices = None
         self.reference_volume_npz = cfg["exp"].get("reference_volume_npz")
-        self.binary_projection_targets = bool(projection_npz)
+        self.visualization_outputs = []
+        self.visualization_errors = []
+        self.binary_projection_targets = False
         self.projection_attenuation = float(
             cfg.get("train", {}).get("projection_attenuation", 1.0)
         )
 
         if projection_npz:
+            if (
+                cfg.get("projection_generation")
+                and not osp.exists(osp.expanduser(str(projection_npz)))
+            ):
+                raise FileNotFoundError(
+                    f"Generated projection NPZ not found: {projection_npz}. "
+                    "Run `python generate_2d_projections.py --config "
+                    "<the-same-case-yaml>` before train.py."
+                )
             source_origin_distance_m = float(
                 cfg["exp"].get("source_origin_distance_m", 0.75)
             )
@@ -87,6 +101,7 @@ class Trainer:
                 projection_npz,
                 source_origin_distance_m=source_origin_distance_m,
             )
+            self.binary_projection_targets = case.is_binary_mask
             view_indices = validate_view_indices(
                 cfg["exp"].get("view_indices", [0, 1]), case.num_views
             )
@@ -131,6 +146,10 @@ class Trainer:
             self.external_projection_case = case
             self.external_view_indices = view_indices
             print(f"External projection NPZ: {case.path}")
+            print(
+                "Projection representation: "
+                f"{case.projection_representation}"
+            )
             print(f"Selected views: {view_indices.tolist()}")
             for index in view_indices:
                 print(
@@ -478,6 +497,8 @@ class Trainer:
                     self.intersection_foreground_voxels
                 ),
             })
+        timing["visualization_outputs"] = self.visualization_outputs
+        timing["visualization_errors"] = self.visualization_errors
 
         timing_path = osp.join(
             self.output_recon_dir,
@@ -546,6 +567,9 @@ class Trainer:
             if case.projection_center_offset_m is None
             else case.projection_center_offset_m.astype(np.float32)
         )
+        surface_prediction_mask = roi_mask
+        surface_reference_mask = None
+        surface_spacing_mm = roi_spacing_mm
 
         payload = {
             "sdf_roi_xyz": np.asarray(sdf_roi, dtype=np.float32),
@@ -609,6 +633,9 @@ class Trainer:
                     reference_shape_xyz=reference_shape,
                     reference_spacing_xyz_mm=reference_spacing,
                 )
+                surface_prediction_mask = full_mask
+                surface_reference_mask = reference_vol
+                surface_spacing_mm = reference_spacing
                 (
                     self.mask_dsc,
                     self.prediction_foreground_voxels,
@@ -656,6 +683,80 @@ class Trainer:
         )
         np.savez_compressed(output_path, **payload)
         print(f"Saved combined NPZ reconstruction: {output_path}")
+        self._save_external_surface_gifs(
+            surface_prediction_mask,
+            surface_reference_mask,
+            surface_spacing_mm,
+        )
+
+    def _save_external_surface_gifs(
+        self,
+        prediction_mask,
+        reference_mask,
+        spacing_mm,
+    ):
+        visualization = self.conf.get("visualization", {})
+        if not visualization.get("save_surface_gifs", True):
+            return
+        try:
+            from src.reconstruction_visualization import save_mask_surface_gif
+
+            frames = int(visualization.get("surface_gif_frames", 24))
+            fps = int(visualization.get("surface_gif_fps", 5))
+            max_faces = int(visualization.get("surface_gif_max_faces", 200_000))
+            masks = []
+            if reference_mask is not None:
+                masks.append((
+                    reference_mask,
+                    "3d_ground_truth_surface.gif",
+                    f"Case {self.current_model_id}: ground-truth surface",
+                ))
+            masks.append((
+                prediction_mask,
+                "3d_prediction_surface.gif",
+                f"Case {self.current_model_id}: prediction surface",
+            ))
+            for mask, filename, title in masks:
+                path = save_mask_surface_gif(
+                    mask,
+                    spacing_mm,
+                    osp.join(self.output_recon_dir, filename),
+                    title=title,
+                    num_frames=frames,
+                    fps=fps,
+                    max_faces=max_faces,
+                )
+                self.visualization_outputs.append(str(path))
+                print(f"Saved rotating surface GIF: {path}")
+        except Exception as error:
+            message = f"Surface GIF generation failed: {type(error).__name__}: {error}"
+            self.visualization_errors.append(message)
+            print(f"WARNING: {message}")
+
+    def _save_external_projection_pngs(self, projections):
+        visualization = self.conf.get("visualization", {})
+        if not visualization.get("save_predicted_projection_pngs", True):
+            return
+        try:
+            from src.reconstruction_visualization import (
+                save_predicted_projection_pngs,
+            )
+
+            paths = save_predicted_projection_pngs(
+                projections,
+                self.external_view_indices,
+                self.output_recon_dir,
+            )
+            self.visualization_outputs.extend(str(path) for path in paths)
+            for path in paths:
+                print(f"Saved predicted projection PNG: {path}")
+        except Exception as error:
+            message = (
+                "Predicted projection PNG generation failed: "
+                f"{type(error).__name__}: {error}"
+            )
+            self.visualization_errors.append(message)
+            print(f"WARNING: {message}")
 
     def run_network_chunked(self, inputs, fn, chunk_size):
         """
@@ -750,6 +851,8 @@ class Trainer:
         pred_projs_data = pred_projs.detach().cpu().numpy()
         np.save(pred_projs_path, pred_projs_data)
         print(f"Saved predicted projections: {pred_projs_path}")
+        if self.external_projection_case is not None:
+            self._save_external_projection_pngs(pred_projs_data)
         
         # Always save ground truth 2D SDF (generated for all modes now)
         gt_sdf_2d_filename = f"sdf_2d_gt_{self.current_model_id}.npy"

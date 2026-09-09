@@ -1,4 +1,6 @@
 data
+generated_inputs/
 __pycache__/
+
 logs
 *.sh
