@@ -5,6 +5,7 @@ from pathlib import Path
 import numpy as np
 
 from src.dataset.stage2_npz import (
+    binary_mask_dice,
     embed_roi_mask_in_reference_grid,
     load_stage2_projection_case,
     stage2_angles_to_camera_frames,
@@ -55,6 +56,23 @@ class Stage2NpzTest(unittest.TestCase):
         )
         self.assertEqual(int(output.sum()), 27)
         self.assertTrue(output[1:4, 1:4, 1:4].all())
+
+    def test_binary_mask_dice_returns_score_and_counts(self):
+        prediction = np.asarray([1, 1, 0, 0], dtype=np.uint8)
+        reference = np.asarray([0, 1, 1, 0], dtype=np.uint8)
+        dice, prediction_count, reference_count, intersection_count = (
+            binary_mask_dice(prediction, reference)
+        )
+        self.assertEqual(dice, 0.5)
+        self.assertEqual(prediction_count, 2)
+        self.assertEqual(reference_count, 2)
+        self.assertEqual(intersection_count, 1)
+
+        empty_dice, _, _, _ = binary_mask_dice(
+            np.zeros((2, 2), dtype=np.uint8),
+            np.zeros((2, 2), dtype=np.uint8),
+        )
+        self.assertEqual(empty_dice, 1.0)
 
 
 if __name__ == "__main__":

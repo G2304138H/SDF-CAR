@@ -15,6 +15,7 @@ from .encoder import get_encoder
 from src.render import run_network
 from .dataset import TIGREDataset as Dataset
 from .dataset.stage2_npz import (
+    binary_mask_dice,
     embed_roi_mask_in_reference_grid,
     load_stage2_projection_case,
     validate_view_indices,
@@ -466,6 +467,17 @@ class Trainer:
                     torch.cuda.max_memory_allocated() / 1024 ** 3
                 ),
             })
+        if hasattr(self, "mask_dsc"):
+            timing.update({
+                "mask_dsc": self.mask_dsc,
+                "prediction_foreground_voxels": (
+                    self.prediction_foreground_voxels
+                ),
+                "reference_foreground_voxels": self.reference_foreground_voxels,
+                "intersection_foreground_voxels": (
+                    self.intersection_foreground_voxels
+                ),
+            })
 
         timing_path = osp.join(
             self.output_recon_dir,
@@ -585,7 +597,8 @@ class Trainer:
                     raise KeyError(
                         "reference_volume_npz must contain 'vol' and 'spacing'."
                     )
-                reference_shape = np.asarray(reference["vol"].shape, dtype=np.int32)
+                reference_vol = np.asarray(reference["vol"])
+                reference_shape = np.asarray(reference_vol.shape, dtype=np.int32)
                 reference_spacing = np.asarray(
                     reference["spacing"], dtype=np.float32
                 ).reshape(3)
@@ -596,11 +609,34 @@ class Trainer:
                     reference_shape_xyz=reference_shape,
                     reference_spacing_xyz_mm=reference_spacing,
                 )
+                (
+                    self.mask_dsc,
+                    self.prediction_foreground_voxels,
+                    self.reference_foreground_voxels,
+                    self.intersection_foreground_voxels,
+                ) = binary_mask_dice(full_mask, reference_vol)
+                print(
+                    "Reference-volume mask DSC: "
+                    f"{self.mask_dsc:.6f} "
+                    f"(prediction={self.prediction_foreground_voxels}, "
+                    f"reference={self.reference_foreground_voxels}, "
+                    f"intersection={self.intersection_foreground_voxels})"
+                )
                 payload.update({
                     "vol": full_mask,
                     "spacing": reference_spacing,
                     "vol_axis_order": np.asarray("XYZ"),
                     "reference_shape_xyz": reference_shape,
+                    "mask_dsc": np.asarray(self.mask_dsc, dtype=np.float64),
+                    "prediction_foreground_voxels": np.asarray(
+                        self.prediction_foreground_voxels, dtype=np.int64
+                    ),
+                    "reference_foreground_voxels": np.asarray(
+                        self.reference_foreground_voxels, dtype=np.int64
+                    ),
+                    "intersection_foreground_voxels": np.asarray(
+                        self.intersection_foreground_voxels, dtype=np.int64
+                    ),
                     "source_reference_npz": np.asarray(
                         str(osp.abspath(self.reference_volume_npz))
                     ),

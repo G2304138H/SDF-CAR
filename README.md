@@ -126,6 +126,12 @@ evaluation, and total compute time are embedded in the reconstruction NPZ. A
 human-readable `timing_<current_model_id>.json` is saved beside it and also
 reports end-to-end wall time, GPU model, and peak allocated GPU memory.
 
+When `reference_volume_npz` is supplied, the final full-grid prediction is
+compared with `reference_volume_npz["vol"] > 0`. The voxel mask Dice score
+`2 * intersection / (prediction + reference)` is printed and saved as
+`mask_dsc` in both the reconstruction NPZ and timing JSON. Foreground and
+intersection voxel counts are saved alongside it for verification.
+
 Direct optimization still requires an NVIDIA CUDA system: the hash-grid
 encoder compiles a CUDA extension and the forward projector uses
 `astra_cuda`. It cannot run on CPU-only or Apple Silicon environments.

@@ -326,9 +326,39 @@ def embed_roi_mask_in_reference_grid(
     return output
 
 
+def binary_mask_dice(
+    prediction_mask: np.ndarray,
+    reference_mask: np.ndarray,
+) -> tuple[float, int, int, int]:
+    """Return Dice and auditable foreground/intersection voxel counts.
+
+    Any nonzero value is treated as foreground. If both masks are empty, their
+    Dice score is defined as 1.0.
+    """
+    prediction = np.asarray(prediction_mask) != 0
+    reference = np.asarray(reference_mask) != 0
+    if prediction.shape != reference.shape:
+        raise ValueError(
+            "Prediction and reference masks must have the same shape, got "
+            f"{prediction.shape} and {reference.shape}."
+        )
+
+    prediction_voxels = int(np.count_nonzero(prediction))
+    reference_voxels = int(np.count_nonzero(reference))
+    intersection_voxels = int(np.count_nonzero(prediction & reference))
+    denominator = prediction_voxels + reference_voxels
+    dice = (
+        1.0
+        if denominator == 0
+        else (2.0 * intersection_voxels) / denominator
+    )
+    return float(dice), prediction_voxels, reference_voxels, intersection_voxels
+
+
 __all__ = [
     "DEFAULT_SOURCE_ORIGIN_DISTANCE_M",
     "Stage2ProjectionCase",
+    "binary_mask_dice",
     "embed_roi_mask_in_reference_grid",
     "load_stage2_projection_case",
     "stage2_angles_to_camera_frames",
