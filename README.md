@@ -257,12 +257,21 @@ exp:
   case_id_width: 4
   projection_filename_pattern: "{case_name}.npz"
   prediction_only: true
+  sid_m: 0.9
+  source_origin_distance_m: 0.75
+  imager_pixel_spacing_mm: 0.65  # LCA; use 0.55 for RCA
 ```
 
 This resolves `/path/to/projection_npzs/lca_0001.npz` and
 `lca_0002.npz`; files that are not listed in `case_ids` are ignored. For a
 nested layout such as `lca_0001/2d.npz`, use
 `projection_filename_pattern: "{case_name}/2d.npz"`.
+
+If a projection NPZ omits `sid` or `imager_pixel_spacing`, the YAML values
+`sid_m` and `imager_pixel_spacing_mm` are used as fallbacks. The Stage-2
+geometry uses SID `0.9 m` and source-to-isocentre distance `0.75 m`. Pixel
+spacing is anatomy-fixed at `0.55 mm` for RCA and `0.65 mm` for LCA. Values
+stored in an NPZ take precedence over these fallbacks.
 
 Run the selected cases sequentially on the visible GPU:
 

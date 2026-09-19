@@ -11,7 +11,11 @@ exp:
   output_recon_dir: ./logs/reconstructions_npz/
   prediction_only: true
   view_indices: [0, 1]
+  # Stage-2 defaults used when these keys are absent from each projection NPZ.
+  sid_m: 0.9
   source_origin_distance_m: 0.75
+  # Use 0.55 for RCA and 0.65 for LCA.
+  imager_pixel_spacing_mm: 0.65
   reconstruction_nVoxel: [128, 128, 128]
   reconstruction_extent_m: null
   output_occupancy_threshold: 0.5

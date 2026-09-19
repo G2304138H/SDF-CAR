@@ -57,6 +57,25 @@ class Stage2NpzTest(unittest.TestCase):
         self.assertFalse(case.is_binary_mask)
         self.assertEqual(case.projection_representation, "line_integral_mm")
 
+    def test_loads_yaml_geometry_fallbacks_when_npz_omits_them(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "rca_0001.npz"
+            np.savez_compressed(
+                path,
+                images=np.zeros((2, 8, 8), dtype=np.float32),
+                theta_deg=np.asarray([0.0, 90.0], dtype=np.float32),
+                phi_deg=np.asarray([0.0, 0.0], dtype=np.float32),
+            )
+            case = load_stage2_projection_case(
+                path,
+                fallback_sid_m=0.9,
+                fallback_detector_pixel_spacing_mm=0.55,
+            )
+
+        self.assertAlmostEqual(case.sid_m, 0.9, places=6)
+        self.assertAlmostEqual(case.detector_origin_distance_m, 0.15, places=6)
+        self.assertAlmostEqual(case.detector_pixel_spacing_m, 0.00055, places=8)
+
     def test_zero_angles_match_stage2_base_camera(self):
         source, detector, u_axis, v_axis = stage2_angles_to_camera_frames(
             np.asarray([0.0]), np.asarray([0.0]), 0.9, 0.75

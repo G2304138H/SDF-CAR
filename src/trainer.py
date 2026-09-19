@@ -173,10 +173,33 @@ class Trainer:
             source_origin_distance_m = float(
                 cfg["exp"].get("source_origin_distance_m", 0.75)
             )
+            fallback_sid_m = cfg["exp"].get("sid_m")
+            fallback_detector_pixel_spacing_mm = cfg["exp"].get(
+                "imager_pixel_spacing_mm"
+            )
             case = load_stage2_projection_case(
                 projection_npz,
                 source_origin_distance_m=source_origin_distance_m,
+                fallback_sid_m=fallback_sid_m,
+                fallback_detector_pixel_spacing_mm=(
+                    fallback_detector_pixel_spacing_mm
+                ),
             )
+            with np.load(projection_npz, allow_pickle=False) as projection_data:
+                used_sid_fallback = (
+                    fallback_sid_m is not None and "sid" not in projection_data.files
+                )
+                used_spacing_fallback = (
+                    fallback_detector_pixel_spacing_mm is not None
+                    and "imager_pixel_spacing" not in projection_data.files
+                )
+            if used_sid_fallback:
+                print(f"Using YAML fallback SID: {float(fallback_sid_m):g} m")
+            if used_spacing_fallback:
+                print(
+                    "Using YAML fallback detector pixel spacing: "
+                    f"{float(fallback_detector_pixel_spacing_mm):g} mm"
+                )
             self.binary_projection_targets = case.is_binary_mask
             view_indices = validate_view_indices(
                 cfg["exp"].get("view_indices", [0, 1]), case.num_views

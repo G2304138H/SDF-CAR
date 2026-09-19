@@ -11,6 +11,10 @@
 - In prediction-only mode, save the current volume and continue the batch when
   the dead-gradient patience is reached, while preserving fail-fast handling
   for non-finite losses or gradients.
+- Allow projection NPZs that omit camera distance/pixel-spacing metadata to use
+  `exp.sid_m` and `exp.imager_pixel_spacing_mm` YAML fallbacks. Document the
+  Stage-2 defaults: SID `0.9 m`, RCA spacing `0.55 mm`, and LCA spacing
+  `0.65 mm`.
 
 ## 2026-09-09 — ODL backward non-finite-gradient fix
 
