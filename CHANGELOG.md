@@ -1,5 +1,17 @@
 # Change log
 
+## 2026-09-19 — Selected-case prediction-only batches
+
+- Add `batch_reconstruct_npz.py` and YAML directory/case selection so entries
+  such as `case_prefix: lca` and `case_ids: ["1", "2"]` resolve only
+  `lca_0001.npz` and `lca_0002.npz`.
+- Add `exp.prediction_only`: ignore reference volumes, skip GT metrics and
+  auxiliary visualisation/checkpoint artifacts, and save a compact NPZ with
+  `vol`, `spacing`, and `vol_axis_order`.
+- In prediction-only mode, save the current volume and continue the batch when
+  the dead-gradient patience is reached, while preserving fail-fast handling
+  for non-finite losses or gradients.
+
 ## 2026-09-09 — ODL backward non-finite-gradient fix
 
 - Default both NPZ reconstruction configurations to full FP32. Their finite

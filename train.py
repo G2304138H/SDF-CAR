@@ -14,11 +14,6 @@ def config_parser():
                         help="configs file path")
     return parser
 
-parser = config_parser()
-args = parser.parse_args()
-
-cfg = load_config(args.config)
-
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # Set seeds for reproducibility
@@ -48,8 +43,12 @@ class BasicTrainer(Trainer):
         """
         Basic network trainer with memory optimizations.
         """
-        # Use provided config or default global config
-        train_cfg = config if config is not None else cfg
+        # Use provided config or the legacy default configuration. Keeping
+        # argument parsing out of module import makes this trainer reusable by
+        # the selected-case batch launcher.
+        train_cfg = (
+            config if config is not None else load_config("./config/CCTA.yaml")
+        )
         train_device = device_override if device_override is not None else device
         
         super().__init__(train_cfg, train_device)
@@ -185,8 +184,14 @@ class BasicTrainer(Trainer):
 
         return loss
 
-if __name__ == "__main__":
+def main():
+    args = config_parser().parse_args()
+    train_cfg = load_config(args.config)
     print("Setting up trainer...")
-    trainer = BasicTrainer()
+    trainer = BasicTrainer(train_cfg)
     print("Starting training...")
     trainer.start()
+
+
+if __name__ == "__main__":
+    main()

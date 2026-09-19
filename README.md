@@ -243,6 +243,50 @@ Direct optimization still requires an NVIDIA CUDA system: the hash-grid
 encoder compiles a CUDA extension and the forward projector uses
 `astra_cuda`. It cannot run on CPU-only or Apple Silicon environments.
 
+### Selected-case NPZ batch reconstruction
+
+Use `batch_reconstruct_npz.py` when a directory contains multiple external
+projection cases and only selected IDs should be reconstructed. Start from
+`config/CCTA_npz_direct_batch.yaml` and configure, for example:
+
+```yaml
+exp:
+  projection_npz_dir: /path/to/projection_npzs
+  case_prefix: lca
+  case_ids: ["1", "2"]
+  case_id_width: 4
+  projection_filename_pattern: "{case_name}.npz"
+  prediction_only: true
+```
+
+This resolves `/path/to/projection_npzs/lca_0001.npz` and
+`lca_0002.npz`; files that are not listed in `case_ids` are ignored. For a
+nested layout such as `lca_0001/2d.npz`, use
+`projection_filename_pattern: "{case_name}/2d.npz"`.
+
+Run the selected cases sequentially on the visible GPU:
+
+```bash
+python batch_reconstruct_npz.py \
+  --config config/CCTA_npz_direct_batch.yaml
+```
+
+With `prediction_only: true`, `reference_volume_npz` is ignored, no GT metric
+is computed, and auxiliary NPY, PNG, GIF, checkpoint, loss-plot, and timing-JSON
+outputs are skipped. Each result NPZ contains only `vol`, `spacing`, and
+`vol_axis_order`. The output for the example above is:
+
+```text
+logs/reconstructions_npz/lca/lca_0001/reconstruction_lca_0001.npz
+logs/reconstructions_npz/lca/lca_0002/reconstruction_lca_0002.npz
+```
+
+`vol` is the thresholded binary `uint8` prediction on the configured
+reconstruction grid. A compact JSONL training diagnostic remains beside each
+prediction. If a projection-only run reaches the configured dead-gradient
+patience, prediction-only mode treats this as convergence, stops that case
+early, saves its current volume, and continues with the next selected case.
+
 ### Batch Training
 To train on multiple models automatically:
 

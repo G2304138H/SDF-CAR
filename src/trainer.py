@@ -88,9 +88,21 @@ class Trainer:
         # its two targets from that volume.  ``projection_npz`` activates the
         # actual paper use case: optimize from external 2D masks and cameras.
         projection_npz = cfg["exp"].get("projection_npz")
+        self.prediction_only = bool(
+            cfg["exp"].get("prediction_only", False)
+        )
         self.external_projection_case = None
         self.external_view_indices = None
-        self.reference_volume_npz = cfg["exp"].get("reference_volume_npz")
+        self.reference_volume_npz = (
+            None
+            if self.prediction_only
+            else cfg["exp"].get("reference_volume_npz")
+        )
+        if self.prediction_only and not projection_npz:
+            raise ValueError(
+                "exp.prediction_only is supported only with an external "
+                "exp.projection_npz input."
+            )
         self.visualization_outputs = []
         self.visualization_errors = []
         self.binary_projection_targets = False
@@ -344,14 +356,41 @@ class Trainer:
         
         # Dataset preparation based on mode
         self.use_sdf = cfg.get("train", {}).get("use_sdf", True)
-        
-        # Always generate 2D SDF targets from ground truth occupancy projections
-        # (needed for SDF loss computation regardless of use_sdf mode)
-        from src.render.sdf_utils import occupancy_to_sdf_2d
-        proj_sdf_one = occupancy_to_sdf_2d(train_projs_one.squeeze(0).squeeze(0), voxel_size=proj_reso[0], use_kornia=False)  # [512, 512]
-        proj_sdf_two = occupancy_to_sdf_2d(train_projs_two.squeeze(0).squeeze(0), voxel_size=proj_reso[1], use_kornia=False)  # [512, 512]
-        data["sdf_projections"] = torch.cat((proj_sdf_one[None, None, :], proj_sdf_two[None, None, :]), 1)  # [1, 2, 512, 512]
-        print(f"Generated 2D SDF targets from GT occupancy projections: {data['sdf_projections'].shape}")
+
+        self.loss_weights = cfg.get(
+            "train", {}
+        ).get("current_loss_weights", [1.0, 1.0])
+        self.projection_weight, self.sdf_loss_weight = (
+            float(weight) for weight in self.loss_weights
+        )
+        if self.projection_weight < 0.0 or self.sdf_loss_weight < 0.0:
+            raise ValueError("Loss weights must be non-negative.")
+        if self.projection_weight == 0.0 and self.sdf_loss_weight == 0.0:
+            raise ValueError("At least one training loss weight must be positive.")
+
+        if self.sdf_loss_weight > 0.0:
+            # Fixed targets may use SciPy because they do not require autograd.
+            from src.render.sdf_utils import occupancy_to_sdf_2d
+
+            proj_sdf_one = occupancy_to_sdf_2d(
+                train_projs_one.squeeze(0).squeeze(0),
+                voxel_size=proj_reso[0],
+                use_kornia=False,
+            )
+            proj_sdf_two = occupancy_to_sdf_2d(
+                train_projs_two.squeeze(0).squeeze(0),
+                voxel_size=proj_reso[1],
+                use_kornia=False,
+            )
+            data["sdf_projections"] = torch.cat(
+                (proj_sdf_one[None, None, :], proj_sdf_two[None, None, :]), 1
+            )
+            print(
+                "Generated 2D SDF targets from GT occupancy projections: "
+                f"{data['sdf_projections'].shape}"
+            )
+        else:
+            print("2D SDF target generation skipped (SDF loss weight is zero).")
 
         # Dataset
         self.dataconfig = data
@@ -361,15 +400,6 @@ class Trainer:
         # Set last_activation based on use_sdf
         cfg["network"]["use_sdf"] = True if self.use_sdf else False
             
-        # Load loss weights from config (respect user's settings regardless of use_sdf)
-        self.loss_weights = cfg.get("train", {}).get("current_loss_weights", [1.0, 1.0])
-        self.projection_weight, self.sdf_loss_weight = (
-            float(weight) for weight in self.loss_weights
-        )
-        if self.projection_weight < 0.0 or self.sdf_loss_weight < 0.0:
-            raise ValueError("Loss weights must be non-negative.")
-        if self.projection_weight == 0.0 and self.sdf_loss_weight == 0.0:
-            raise ValueError("At least one training loss weight must be positive.")
         if self.sdf_loss_weight > 0.0:
             from src.render.sdf_utils import (
                 require_differentiable_distance_transform,
@@ -516,6 +546,8 @@ class Trainer:
         self._synchronize_cuda_for_timing()
         run_started = time.perf_counter()
         optimization_started = time.perf_counter()
+        epochs_completed = 0
+        self.stop_reason = None
         self._initialize_training_log()
 
         for idx_epoch in tqdm(range(1, self.epochs+1)):
@@ -535,6 +567,7 @@ class Trainer:
             current_loss = loss_train['loss']
             self.training_losses.append(current_loss)
             self._append_training_log(idx_epoch, loss_train)
+            epochs_completed = idx_epoch
 
             print(
                 f"epoch={idx_epoch}/{self.epochs}, loss={current_loss:.6f}, "
@@ -577,11 +610,20 @@ class Trainer:
                     f"inspect {self.training_log_path}."
                 )
             if self.dead_gradient_epochs >= self.zero_gradient_patience:
-                raise RuntimeError(
+                message = (
                     "Optimization has produced no usable gradient for "
-                    f"{self.dead_gradient_epochs} consecutive epochs. Aborting "
-                    "instead of continuing a constant-loss run. Inspect "
-                    f"{self.training_log_path}."
+                    f"{self.dead_gradient_epochs} consecutive epochs."
+                )
+                if self.prediction_only:
+                    self.stop_reason = "dead_gradient_early_stop"
+                    print(
+                        f"{message} Saving the current prediction and ending "
+                        "this case early."
+                    )
+                    break
+                raise RuntimeError(
+                    f"{message} Aborting instead of continuing a constant-loss "
+                    f"run. Inspect {self.training_log_path}."
                 )
 
         self._synchronize_cuda_for_timing()
@@ -589,8 +631,8 @@ class Trainer:
             time.perf_counter() - optimization_started
         )
         self.mean_epoch_time_seconds = (
-            self.optimization_time_seconds / self.epochs
-            if self.epochs > 0 else 0.0
+            self.optimization_time_seconds / epochs_completed
+            if epochs_completed > 0 else 0.0
         )
         print(
             "Optimization time: "
@@ -599,11 +641,13 @@ class Trainer:
             f"mean {self.mean_epoch_time_seconds:.4f} s/epoch"
         )
             
-        # Save loss plot after training completion
-        self.save_loss_plot()
+        # Prediction-only batches keep output small: the diagnostic JSONL is
+        # retained, but plots and all auxiliary reconstruction files are not.
+        if not self.prediction_only:
+            self.save_loss_plot()
         
         # Evaluate and save the last model at the end
-        print(f"\nEvaluating last model from epoch {self.epochs}")
+        print(f"\nEvaluating last model from epoch {epochs_completed}")
         
         # Evaluate last model (current state)
         self._synchronize_cuda_for_timing()
@@ -633,7 +677,7 @@ class Trainer:
             )
             
             # Save last model results with all the comprehensive outputs
-            self._save_best_model_results(model_pred, self.epochs)
+            self._save_best_model_results(model_pred, epochs_completed)
 
         self._synchronize_cuda_for_timing()
         self.end_to_end_time_seconds = (
@@ -641,9 +685,12 @@ class Trainer:
             + time.perf_counter() - run_started
         )
         self.case_completed_at_utc = datetime.now(timezone.utc).isoformat()
-        self._save_case_timing()
+        if not self.prediction_only:
+            self._save_case_timing()
         
-        tqdm.write(f"Training complete! Saved last model from epoch {self.epochs}")
+        tqdm.write(
+            f"Training complete! Saved last model from epoch {epochs_completed}"
+        )
 
     def _save_case_timing(self):
         """Write human-readable timing and environment metadata for this case."""
@@ -706,10 +753,11 @@ class Trainer:
         if self.use_sdf:
             # SDF mode: model generates SDF, we convert to occupancy for projections
             print("SDF mode: Model generated 3D SDF")
-            sdf_3d_filename = f"sdf_3d_{self.current_model_id}.npy"
-            sdf_3d_path = osp.join(self.output_recon_dir, sdf_3d_filename)
-            np.save(sdf_3d_path, model_pred)
-            print(f"Saved 3D SDF prediction: {sdf_3d_path}")
+            if not self.prediction_only:
+                sdf_3d_filename = f"sdf_3d_{self.current_model_id}.npy"
+                sdf_3d_path = osp.join(self.output_recon_dir, sdf_3d_filename)
+                np.save(sdf_3d_path, model_pred)
+                print(f"Saved 3D SDF prediction: {sdf_3d_path}")
             
             # Convert SDF to occupancy for projections
             from src.render.sdf_utils import sdf_to_occupancy
@@ -718,25 +766,30 @@ class Trainer:
             )
             
             # Save converted occupancy
-            occupancy_3d_filename = f"recon_occupancy_{self.current_model_id}.npy"
-            occupancy_3d_path = osp.join(self.output_recon_dir, occupancy_3d_filename)
             occupancy_3d_data = occupancy_for_proj.squeeze().detach().cpu().numpy()
-            np.save(occupancy_3d_path, occupancy_3d_data)
-            print(f"Saved occupancy converted from SDF: {occupancy_3d_path}")
+            if not self.prediction_only:
+                occupancy_3d_filename = f"recon_occupancy_{self.current_model_id}.npy"
+                occupancy_3d_path = osp.join(self.output_recon_dir, occupancy_3d_filename)
+                np.save(occupancy_3d_path, occupancy_3d_data)
+                print(f"Saved occupancy converted from SDF: {occupancy_3d_path}")
             
         else:
             # Occupancy mode: model generates occupancy directly
             print("Occupancy mode: Model generated 3D occupancy")
-            occupancy_3d_filename = f"recon_occupancy_{self.current_model_id}.npy"
-            occupancy_3d_path = osp.join(self.output_recon_dir, occupancy_3d_filename)
-            np.save(occupancy_3d_path, model_pred)
-            print(f"Saved 3D occupancy prediction: {occupancy_3d_path}")
+            if not self.prediction_only:
+                occupancy_3d_filename = f"recon_occupancy_{self.current_model_id}.npy"
+                occupancy_3d_path = osp.join(self.output_recon_dir, occupancy_3d_filename)
+                np.save(occupancy_3d_path, model_pred)
+                print(f"Saved 3D occupancy prediction: {occupancy_3d_path}")
             
             occupancy_for_proj = pred_tensor
             occupancy_3d_data = model_pred
 
         if self.external_projection_case is not None:
             self._save_external_reconstruction_npz(model_pred, occupancy_3d_data)
+
+        if self.prediction_only:
+            return
         
         # Save all other comprehensive outputs (GT, projections, images, comparisons, network)
         self._save_comprehensive_outputs(pred_tensor, occupancy_for_proj, epoch)
@@ -756,6 +809,21 @@ class Trainer:
         )
         roi_mask = (np.asarray(occupancy_roi) >= threshold).astype(np.uint8)
         roi_spacing_mm = np.asarray(self.dataconfig["dVoxel"], dtype=np.float32)
+
+        output_path = osp.join(
+            self.output_recon_dir,
+            f"reconstruction_{self.current_model_id}.npz",
+        )
+        if self.prediction_only:
+            np.savez_compressed(
+                output_path,
+                vol=roi_mask,
+                spacing=roi_spacing_mm,
+                vol_axis_order=np.asarray("XYZ"),
+            )
+            print(f"Saved prediction-only NPZ: {output_path}")
+            return
+
         center_m = (
             np.zeros(3, dtype=np.float32)
             if case.projection_center_offset_m is None
@@ -881,10 +949,6 @@ class Trainer:
                 "vol_axis_order": np.asarray("XYZ"),
             })
 
-        output_path = osp.join(
-            self.output_recon_dir,
-            f"reconstruction_{self.current_model_id}.npz",
-        )
         np.savez_compressed(output_path, **payload)
         print(f"Saved combined NPZ reconstruction: {output_path}")
         self._save_external_surface_gifs(

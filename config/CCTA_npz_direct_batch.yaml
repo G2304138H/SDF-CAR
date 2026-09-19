@@ -1,0 +1,62 @@
+exp:
+  dataconfig: ./config/config.yml
+
+  # Resolves lca_0001.npz and lca_0002.npz from the directory below.
+  projection_npz_dir: /export/home2/reny0012/code/SDF-CAR/data/projections
+  case_prefix: lca
+  case_ids: ["1", "2"]
+  case_id_width: 4
+  projection_filename_pattern: "{case_name}.npz"
+
+  output_recon_dir: ./logs/reconstructions_npz/
+  prediction_only: true
+  view_indices: [0, 1]
+  source_origin_distance_m: 0.75
+  reconstruction_nVoxel: [128, 128, 128]
+  reconstruction_extent_m: null
+  output_occupancy_threshold: 0.5
+
+network:
+  net_type: mlp
+  num_layers: 8
+  hidden_dim: 256
+  skips: [4]
+  out_dim: 1
+  bound: 0.3
+  sdf_initial_bias: 0.1
+  use_gradient_checkpointing: true
+
+encoder:
+  encoding: hashgrid
+  input_dim: 3
+  num_levels: 16
+  level_dim: 2
+  base_resolution: 16
+  log2_hashmap_size: 19
+
+render:
+  netchunk: 699060
+
+train:
+  epoch: 5000
+  seed: 42
+  lrate: 0.0001
+  mixed_precision: false
+  amp_initial_scale: 1.0
+  gradient_probe_epochs: 1
+  weight_decay: 0.000001
+  memory_efficient_eval: true
+  use_sdf: true
+  sdf_alpha: 50.0
+  minimum_gradient_norm: 0.000000000001
+  zero_gradient_patience: 20
+  sdf_distance_epsilon: 0.000001
+  sdf_loss_warmup_epochs: 100
+  sdf_loss_ramp_epochs: 400
+  projection_attenuation: 1.0
+
+  # Projection-only adaptation: the released geometric SDF loss is disabled.
+  current_loss_weights: [0.25, 0.0]
+  camera_noise_enabled: false
+  camera_position_noise_std: 0.0
+  camera_orientation_noise_std: 0.0
